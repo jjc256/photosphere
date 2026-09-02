@@ -4,7 +4,7 @@
   --muted: #9aa0aa;
   --accent: #4f8cff;
   --accent-2: #33d29b;
-  --chip-bg: rgba(20, 20, 26, 0.62);
+  --chip-bg: rgba(22, 22, 28, 0.92);
   --chip-br: rgba(255, 255, 255, 0.14);
   --safe-t: env(safe-area-inset-top, 0px);
   --safe-b: env(safe-area-inset-bottom, 0px);
@@ -42,8 +42,6 @@ body { position: fixed; inset: 0; overflow: hidden; }
   font-size: 15px;
   font-weight: 600;
   cursor: pointer;
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
 }
 .btn:active { transform: scale(0.97); }
 .btn-primary { background: var(--accent); border-color: transparent; color: #fff; }
@@ -59,8 +57,6 @@ body { position: fixed; inset: 0; overflow: hidden; }
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
 }
 .chip:active { transform: scale(0.96); }
 .chip-accent { color: var(--accent-2); }
@@ -145,8 +141,6 @@ h1 { font-size: 30px; margin: 0 0 8px; letter-spacing: -0.02em; }
   padding: 6px 14px;
   font-size: 12px;
   color: var(--muted);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
   white-space: nowrap;
 }
 
@@ -184,13 +178,11 @@ h1 { font-size: 30px; margin: 0 0 8px; letter-spacing: -0.02em; }
   position: absolute;
   left: calc(12px + var(--safe-l)); right: calc(12px + var(--safe-r));
   bottom: calc(108px + var(--safe-b));
-  background: rgba(14, 14, 20, 0.92);
+  background: rgba(14, 14, 20, 0.97);
   border: 1px solid var(--chip-br);
   border-radius: 16px;
   padding: 16px;
   display: none;
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
 }
 .panel.is-open { display: block; }
 .panel label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 8px; }
@@ -235,16 +227,14 @@ canvas.gl-mini {
   color: var(--muted); font-size: 12px;
   background: var(--chip-bg); border: 1px solid var(--chip-br);
   padding: 6px 14px; border-radius: 999px;
-  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
 }
 .review-bottom { flex-direction: column; gap: 10px; }
 .review-bottom .btn { width: min(420px, 100%); }
 .export-status {
   position: absolute; inset: 0;
   display: grid; place-items: center;
-  background: rgba(0, 0, 0, 0.7);
+  background: rgba(8, 8, 12, 0.94);
   font-size: 15px; color: var(--fg);
-  backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
 }
 
 /* ---------- toast ---------- */
