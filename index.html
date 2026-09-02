@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PhotoSphere — 360° Camera</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+<meta name="description" content="Capture and download 360° panoramic photos with your phone's camera.">
+<meta name="theme-color" content="#0b0b0f">
+
+<!-- iOS standalone / Add to Home Screen -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="PhotoSphere">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="manifest" href="manifest.webmanifest">
+
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- ============ START SCREEN ============ -->
+<section id="screen-start" class="screen is-active">
+  <div class="start-card">
+    <div class="logo" aria-hidden="true">
+      <svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="44" fill="none" stroke="currentColor" stroke-width="3"/><ellipse cx="50" cy="50" rx="44" ry="17" fill="none" stroke="currentColor" stroke-width="3"/><ellipse cx="50" cy="50" rx="17" ry="44" fill="none" stroke="currentColor" stroke-width="3"/><line x1="6" y1="50" x2="94" y2="50" stroke="currentColor" stroke-width="3"/></svg>
+    </div>
+    <h1>PhotoSphere</h1>
+    <p class="tagline">Stand still, spin slowly, and sweep your phone across the whole scene. PhotoSphere stitches a 360°&nbsp;×&nbsp;180° panorama you can download.</p>
+    <button id="btn-start" class="btn btn-primary btn-lg">Start capture</button>
+    <p id="start-note" class="note"></p>
+    <details class="tips">
+      <summary>Capture tips</summary>
+      <ul>
+        <li>Pivot the phone around <em>your body's</em> axis — keep it close to you, don't walk.</li>
+        <li>Move slowly and pause; frames are grabbed when the phone is steady.</li>
+        <li>Overlap each frame with the last. Watch the grid fill in.</li>
+        <li>Best results outdoors or in large rooms with distant walls.</li>
+        <li>Set the field-of-view slider to match your lens if edges don't line up.</li>
+      </ul>
+    </details>
+  </div>
+</section>
+
+<!-- ============ CAPTURE SCREEN ============ -->
+<section id="screen-capture" class="screen">
+  <video id="cam" playsinline muted autoplay></video>
+
+  <div id="hud" class="hud" aria-hidden="true">
+    <div id="grid" class="grid"></div>
+    <div id="reticle" class="reticle"></div>
+  </div>
+
+  <div class="cap-top">
+    <button id="btn-cancel" class="chip">✕</button>
+    <div id="coverage" class="chip coverage">0%</div>
+    <button id="btn-gear" class="chip">FOV</button>
+  </div>
+
+  <div id="hint" class="hint">Hold steady…</div>
+
+  <div class="cap-bottom">
+    <button id="btn-reset" class="chip">Reset</button>
+    <button id="btn-shutter" class="shutter" aria-label="Capture frame"></button>
+    <button id="btn-done" class="chip chip-accent">Done</button>
+  </div>
+
+  <canvas id="gl" class="gl-mini"></canvas>
+
+  <div id="panel-fov" class="panel">
+    <label for="fov">Horizontal field of view <span id="fov-val">55°</span></label>
+    <input id="fov" type="range" min="35" max="110" step="1" value="55">
+    <label for="autocap" class="row"><input id="autocap" type="checkbox" checked> Auto-capture while moving</label>
+    <label for="geo" class="row"><input id="geo" type="checkbox" checked> Tag GPS location <span class="req">— required for Google Maps</span></label>
+    <p id="geo-status" class="substat">Location off</p>
+    <label for="vidrot" class="row">Frame rotation
+      <select id="vidrot">
+        <option value="0" selected>0°</option>
+        <option value="1">90°</option>
+        <option value="2">180°</option>
+        <option value="3">270°</option>
+      </select>
+    </label>
+    <button id="btn-fov-close" class="btn">Close</button>
+  </div>
+
+  <div id="sim-banner" class="sim-banner" hidden>No motion sensors — drag the video to aim (desktop test mode).</div>
+</section>
+
+<!-- ============ REVIEW SCREEN ============ -->
+<section id="screen-review" class="screen">
+  <div id="viewer" class="gl-full-slot"></div>
+
+  <div class="cap-top">
+    <button id="btn-back" class="chip">Retake</button>
+    <button id="btn-viewmode" class="chip">Flat view</button>
+    <div class="chip" id="review-cov">—</div>
+  </div>
+
+  <div class="review-hint">Drag to look around · pinch or scroll to zoom</div>
+
+  <div class="cap-bottom review-bottom">
+    <button id="btn-download" class="btn btn-primary btn-lg">Download 360° photo</button>
+    <button id="btn-share" class="btn" hidden>Share</button>
+  </div>
+
+  <div id="export-status" class="export-status" hidden></div>
+</section>
+
+<div id="toast" class="toast" hidden></div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

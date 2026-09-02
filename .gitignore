@@ -1,0 +1,12 @@
+# Self-signed dev certificates (private key — never commit; regenerate with `node serve.mjs --cert`)
+cert/
+
+# Dependencies / build output
+node_modules/
+dist/
+
+# OS / editor cruft
+.DS_Store
+*.log
+.vercel
+.netlify
