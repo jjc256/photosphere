@@ -684,11 +684,16 @@ export class PanoEngine {
     this._k1 = k1;
     this._initComposite();
     const w = this.cs, h = this.csh;
-    const rots = frames.map((f) => matT3col(f.R));
+    // A gyro-only frame may be close enough to cover a hole, but it must not
+    // influence a feature-aligned seam. Once we have a viable aligned set,
+    // leave those uncertain areas empty instead of introducing ghost fragments.
+    const aligned = frames.filter((f) => !f.weak);
+    const blendFrames = aligned.length >= 2 ? aligned : frames;
+    const rots = blendFrames.map((f) => matT3col(f.R));
     const warpTo = (prog, fbo, k) => {
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
       this._vp();
-      this._warpUniforms(prog, rots[k], tanX, tanY, frames[k].gain || 1, frames[k].vidRot || 0);
+      this._warpUniforms(prog, rots[k], tanX, tanY, blendFrames[k].gain || 1, blendFrames[k].vidRot || 0);
     };
 
     // ---- 1. consensus mosaic (feather average) -> avgTex ----------------
@@ -697,7 +702,7 @@ export class PanoEngine {
     gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
     gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD); gl.blendFunc(gl.ONE, gl.ONE);
     gl.useProgram(this.pFA);
-    frames.forEach((fr, k) => {
+    blendFrames.forEach((fr, k) => {
       this._uploadFrame(fr.img);
       warpTo(this.pFA, this.accLoFbo, k);
       this._quad();
@@ -722,7 +727,7 @@ export class PanoEngine {
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-    frames.forEach((fr, k) => {
+    blendFrames.forEach((fr, k) => {
       this._uploadFrame(fr.img);
       // disagreement -> mTex
       gl.useProgram(this.pDiff);
@@ -779,7 +784,7 @@ export class PanoEngine {
       gl.disable(gl.BLEND);
     };
 
-    frames.forEach((fr, k) => {
+    blendFrames.forEach((fr, k) => {
       this._uploadFrame(fr.img);
       // warp -> wTex, band split -> wLoTex
       gl.useProgram(this.pWarpC);

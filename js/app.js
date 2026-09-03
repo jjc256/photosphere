@@ -8,7 +8,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.8.0';
+const APP_VERSION = '0.8.1';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -17,8 +17,8 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const MAX_SHOTS = 50;   // memory-bounded; ImageData is kept for the final blend
 const CAP_LONG = 800;   // long side kept for compositing
 const GRAY_LONG = 512;  // long side used for feature detection
-const CAP_STEP = 14 * Math.PI / 180; // grab a frame every ~14° of pan (overlap guarantee)
-const FEAT_MIN = 7;     // capture-time corner floor (countCorners samples a 3px grid)
+const CAP_STEP = 12 * Math.PI / 180; // grab a frame every ~12° of pan (overlap guarantee)
+const FEAT_MIN = 20;    // capture-time corner floor (countCorners samples a 3px grid)
 
 const state = {
   stream: null,
@@ -344,7 +344,7 @@ function updateGuidance(now) {
   // Frames are grabbed as you sweep, every CAP_STEP of pan. Motion blur is the
   // thing that kills feature matching, so rather than grabbing the instant the
   // step is reached, wait for the next slow moment (hands always micro-pause)
-  // and only force a grab if we've drifted well past the step. Costs nothing
+  // and only force a grab after a small overshoot. Costs nothing
   // extra and biases every frame toward the sharpest instant available.
   const movedSince = state.lastCapQuat ? quatAngle(state.quat, state.lastCapQuat) : Infinity;
   const sweeping = state.speed < 0.28;           // < ~16°/s: blur stays small
@@ -370,7 +370,7 @@ function updateGuidance(now) {
   // Extra in-between frames while sweeping from dot to dot, purely to keep
   // neighbours overlapping. These are feature-gated and never tick a dot off.
   if (!grabbed && state.shots.length < MAX_SHOTS && cooled && sweeping &&
-      (movedSince > CAP_STEP * 1.7 || (movedSince > CAP_STEP && slowNow))) {
+      (movedSince > CAP_STEP * 1.25 || (movedSince > CAP_STEP && slowNow))) {
     if (doCapture(false)) grabbed = true;
   }
 
