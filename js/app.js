@@ -8,7 +8,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.7.2';
+const APP_VERSION = '0.7.3';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -214,7 +214,7 @@ function stashShot(manual) {
     imgData: big.data, w: big.w, h: big.h,
     gray, gw: sm.w, gh: sm.h, sharp, feat,
     speed: state.speed, t: Math.round(performance.now()),
-    quat: state.quat.slice(), hfovDeg: state.hfovDeg,
+    quat: state.quat.slice(), hfovDeg: state.hfovDeg, vidRot: state.vidRot,
   });
   if (state.shots.length > MAX_SHOTS) {
     // over budget: drop one of the closest-together pair (so unique coverage is
@@ -575,6 +575,7 @@ async function toReview() {
       const parts = state.shots.map((s, k) => ({
         img: s.imgData, R: result.rotations[k], gain: result.gains[k],
         weak: nConn >= 3 && !result.connected[k],
+        vidRot: s.vidRot,
       }));
       state.engine.compositeStitched(parts, tanX, tanY);
       if (nConn < state.shots.length) toast(`Aligned ${nConn} of ${state.shots.length} frames`);

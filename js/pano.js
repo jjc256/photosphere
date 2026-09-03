@@ -101,6 +101,7 @@ in vec2 vUv;
 uniform mat3 uRot;       // camera -> world (pass transpose of row-major c2w)
 uniform vec2 uTan;       // tan(hfov/2), tan(vfov/2)
 uniform float uGain;
+uniform mat2 uVidRot;    // in-plane frame rotation
 uniform sampler2D uFrame;
 const float PI = 3.14159265359;
 bool warp(out vec3 rgb, out float edge) {
@@ -113,9 +114,10 @@ bool warp(out vec3 rgb, out float edge) {
   float px = (cam.x / -cam.z) / uTan.x;
   float py = (cam.y / -cam.z) / uTan.y;
   if (max(abs(px), abs(py)) > 1.0) return false;
-  vec2 uv = vec2(px, py) * 0.5 + 0.5;
+  vec2 rp = uVidRot * vec2(px, py);
+  vec2 uv = rp * 0.5 + 0.5;
   rgb = clamp(texture(uFrame, uv).rgb * uGain, 0.0, 1.0);
-  edge = min(1.0 - abs(px), 1.0 - abs(py));   // distance to nearest frame edge, 0..1
+  edge = min(1.0 - abs(rp.x), 1.0 - abs(rp.y));   // distance to nearest frame edge, 0..1
   return true;
 }`;
 
@@ -167,7 +169,8 @@ void main() {
   vec3 rgb; float edge;
   if (!warp(rgb, edge)) discard;
   float cost = texture(uCost, vUv).r;
-  float pri = clamp(edge - uLambda * cost, 0.0, 1.0) * uPriority;
+  float center = smoothstep(0.02, 0.45, edge);
+  float pri = clamp(center * edge - uLambda * cost, 0.0, 1.0) * uPriority;
   gl_FragDepth = 1.0 - pri * 0.999;    // higher priority -> smaller depth -> wins
   frag = vec4((uIndex + 1.0) / 255.0, edge, 0.0, 1.0);
 }`;
@@ -636,11 +639,14 @@ export class PanoEngine {
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
   }
 
-  _warpUniforms(prog, uRot, tanX, tanY, gain) {
+  _warpUniforms(prog, uRot, tanX, tanY, gain, vidRot = 0) {
     const gl = this.gl;
+    const a = (vidRot % 4) * Math.PI / 2;
+    const c = Math.cos(a), s = Math.sin(a);
     gl.uniformMatrix3fv(gl.getUniformLocation(prog, 'uRot'), false, uRot);
     gl.uniform2f(gl.getUniformLocation(prog, 'uTan'), tanX, tanY);
     gl.uniform1f(gl.getUniformLocation(prog, 'uGain'), gain);
+    gl.uniformMatrix2fv(gl.getUniformLocation(prog, 'uVidRot'), false, [c, s, -s, c]);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
     gl.uniform1i(gl.getUniformLocation(prog, 'uFrame'), 0);
@@ -664,7 +670,7 @@ export class PanoEngine {
 
   _vp() { this.gl.viewport(0, 0, this.cs, this.csh); }
 
-  // frames: [{ img, R (row-major camera->world), gain, weak }]. tanX/tanY =
+  // frames: [{ img, R (row-major camera->world), gain, weak, vidRot }]. tanX/tanY =
   // tan(fov/2) for the focal-corrected lens. Fills panoTex.
   compositeStitched(frames, tanX, tanY) {
     const gl = this.gl;
@@ -674,7 +680,7 @@ export class PanoEngine {
     const warpTo = (prog, fbo, k) => {
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
       this._vp();
-      this._warpUniforms(prog, rots[k], tanX, tanY, frames[k].gain || 1);
+      this._warpUniforms(prog, rots[k], tanX, tanY, frames[k].gain || 1, frames[k].vidRot || 0);
     };
 
     // ---- 1. consensus mosaic (feather average) -> avgTex ----------------
@@ -726,9 +732,9 @@ export class PanoEngine {
       gl.disable(gl.BLEND);
       gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.mHi);
       gl.uniform1i(gl.getUniformLocation(this.pLabel, 'uCost'), 1);
-      gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uLambda'), 0.6);
+      gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uLambda'), fr.weak ? 1.1 : 0.72);
       gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uIndex'), k);
-      gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uPriority'), fr.weak ? 0.18 : 1.0);
+      gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uPriority'), fr.weak ? 0.08 : 1.0);
       this._quad();
       gl.disable(gl.DEPTH_TEST);
     });
