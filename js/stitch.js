@@ -40,10 +40,14 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   const feats = [];
   for (let i = 0; i < N; i++) {
     onProgress('features', i / N);
-    feats.push(detectAndDescribe(shots[i].gray, shots[i].w, shots[i].h, { fastThresh: 14, maxFeatures: 800 }));
+    feats.push(detectAndDescribe(shots[i].gray, shots[i].w, shots[i].h,
+      { fastThresh: 18, maxFeatures: 900, minKeypoints: 120 }));
     await tick();
   }
-  log.push('features: ' + feats.map((f) => f.kps.length).join(','));
+  const counts = feats.map((f) => f.kps.length);
+  const usable = counts.filter((c) => c >= 60).length;
+  log.push(`features: ${counts.join(',')}`);
+  log.push(`usable frames (>=60 feat): ${usable}/${N}`);
 
   // 2. candidate pairs: IMU-adjacent (bounded fan-out) + every consecutive pair
   // (capture order tracks a sweep, and covers the case where the gyro is dead).

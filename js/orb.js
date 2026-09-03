@@ -66,9 +66,9 @@ const PATTERN = (() => {
 const POP = (() => { const t = new Uint8Array(256); for (let i = 0; i < 256; i++) t[i] = (i & 1) + t[i >> 1]; return t; })();
 
 export function detectAndDescribe(gray, w, h, {
-  fastThresh = 20, maxFeatures = 700, nmsRadius = 7,
+  fastThresh = 20, maxFeatures = 700, nmsRadius = 7, blurPasses = 1, minKeypoints = 90, _depth = 0,
 } = {}) {
-  const g = blur(gray, w, h, 2);
+  const g = blur(gray, w, h, blurPasses);
   const border = PATCH + 4;
   const cand = [];
 
@@ -131,6 +131,14 @@ export function detectAndDescribe(gray, w, h, {
     if (!grid.has(key)) grid.set(key, []);
     grid.get(key).push(k);
     kps.push(k);
+  }
+
+  // adaptive: low-contrast frame -> retry with a gentler corner threshold
+  if (kps.length < minKeypoints && fastThresh > 6 && _depth < 2) {
+    return detectAndDescribe(gray, w, h, {
+      fastThresh: Math.max(6, Math.round(fastThresh * 0.55)),
+      maxFeatures, nmsRadius, blurPasses, minKeypoints, _depth: _depth + 1,
+    });
   }
 
   // orientation (intensity centroid) + descriptor

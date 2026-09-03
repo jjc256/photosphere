@@ -7,7 +7,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir, inFrustum,
 } from './orientation.js';
 
-const APP_VERSION = '0.4.1';
+const APP_VERSION = '0.4.2';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -19,7 +19,8 @@ const LAT_MAX = 62, LAT_MIN = -62; // degrees; poles are hard to shoot hand-held
 // ---- captured-frame budget --------------------------------------------------
 const MAX_SHOTS = 32;   // memory-bounded; ImageData is kept for the final blend
 const CAP_LONG = 1024;  // long side kept for compositing
-const GRAY_LONG = 400;  // long side used for feature detection
+const GRAY_LONG = 512;  // long side used for feature detection
+const SHARP_MIN = 4.0;  // mean |gradient| floor — below this a frame is too blurred to match
 
 const state = {
   stream: null,
@@ -221,36 +222,56 @@ function refreshGridClasses() {
 }
 
 // ---- capture --------------------------------------------------------------
-function stashShot() {
+const _capCanvas = document.createElement('canvas');
+
+function grabFrame(long, vw, vh) {
+  const s = Math.min(1, long / Math.max(vw, vh));
+  const w = Math.max(8, Math.round(vw * s)), h = Math.max(8, Math.round(vh * s));
+  _capCanvas.width = w; _capCanvas.height = h;
+  const ctx = _capCanvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(video, 0, 0, w, h);
+  return { w, h, data: ctx.getImageData(0, 0, w, h) };
+}
+
+// mean absolute gradient of a luma buffer — a cheap blur/sharpness proxy
+function sharpness(gray, w, h) {
+  let sum = 0, n = 0;
+  for (let y = 1; y < h - 1; y += 2) {
+    for (let x = 1; x < w - 1; x += 2) {
+      const i = y * w + x;
+      sum += Math.abs(gray[i] - gray[i + 1]) + Math.abs(gray[i] - gray[i + w]);
+      n += 2;
+    }
+  }
+  return n ? sum / n : 0;
+}
+
+function stashShot(manual) {
   const vw = video.videoWidth, vh = video.videoHeight;
   if (!vw) return;
-  const draw = (long) => {
-    const s = Math.min(1, long / Math.max(vw, vh));
-    const w = Math.max(8, Math.round(vw * s)), h = Math.max(8, Math.round(vh * s));
-    const c = (draw._c = draw._c || document.createElement('canvas'));
-    c.width = w; c.height = h;
-    const ctx = c.getContext('2d', { willReadFrequently: true });
-    ctx.drawImage(video, 0, 0, w, h);
-    return { w, h, data: ctx.getImageData(0, 0, w, h) };
-  };
-  const big = draw(CAP_LONG);
-  const sm = draw(GRAY_LONG);
+  const sm = grabFrame(GRAY_LONG, vw, vh);
   const gray = new Uint8ClampedArray(sm.w * sm.h);
   const d = sm.data.data;
   for (let i = 0, p = 0; i < gray.length; i++, p += 4) {
     gray[i] = (d[p] * 77 + d[p + 1] * 150 + d[p + 2] * 29) >> 8;
   }
+  const sharp = sharpness(gray, sm.w, sm.h);
+  // auto-captured but clearly motion-blurred / featureless -> skip it
+  if (!manual && sharp < SHARP_MIN) { $('hint').textContent = 'Too blurry — hold still'; return; }
+
+  const big = grabFrame(CAP_LONG, vw, vh);
   state.shots.push({
     imgData: big.data, w: big.w, h: big.h,
-    gray, gw: sm.w, gh: sm.h,
+    gray, gw: sm.w, gh: sm.h, sharp,
     quat: state.quat.slice(), hfovDeg: state.hfovDeg,
   });
   if (state.shots.length > MAX_SHOTS) {
+    // drop the weaker of the closest-together pair (blurrier frame loses)
     let bi = 0, bd = Infinity;
     for (let i = 0; i < state.shots.length; i++) {
       for (let j = i + 1; j < state.shots.length; j++) {
         const a = quatAngle(state.shots[i].quat, state.shots[j].quat);
-        if (a < bd) { bd = a; bi = i; }
+        if (a < bd) { bd = a; bi = state.shots[i].sharp <= state.shots[j].sharp ? i : j; }
       }
     }
     state.shots.splice(bi, 1);
@@ -262,7 +283,7 @@ function doCapture(manual) {
   updateOrientation(); // capture against the freshest pose
   const { tanX, tanY } = fovTangents();
   state.engine.splat(video, state.R, tanX, tanY, state.vidRot); // live guide preview
-  stashShot();                                                  // for the real stitch on Done
+  stashShot(manual);                                            // for the real stitch on Done
   state.lastCapQuat = state.quat;
   markCovered(state.R, tanX, tanY);
   const s = $('btn-shutter');
@@ -280,10 +301,13 @@ function maybeAutoCapture(now) {
   state.speedQuat = state.quat;
   state.speedT = now;
 
+  // require several consecutive slow frames — a phone still mid-swing blurs
+  state.steadyFrames = state.speed < 0.22 ? (state.steadyFrames || 0) + 1 : 0; // rad/s ≈ 13°/s
+  const steady = state.steadyFrames >= 3;
+
   const hint = $('hint');
   if (!state.autoCap) { hint.textContent = 'Tap the shutter to grab a frame'; return; }
 
-  const steady = state.speed < 0.7; // rad/s
   const moved = state.lastCapQuat ? quatAngle(state.quat, state.lastCapQuat) : Infinity;
   const step = (state.hfovDeg * DEG) * 0.42;
 
@@ -292,7 +316,7 @@ function maybeAutoCapture(now) {
     if (steady) doCapture(false);
     return;
   }
-  if (!steady) hint.textContent = 'Slow down…';
+  if (!steady) hint.textContent = 'Pause to capture';
   else if (moved < step) hint.textContent = 'Pan to a new area';
   else { hint.textContent = 'Capturing…'; doCapture(false); }
 }
