@@ -70,8 +70,9 @@ const POP = (() => { const t = new Uint8Array(256); for (let i = 0; i < 256; i++
 export function countCorners(gray, w, h, fastThresh = 14) {
   const border = 6;
   let n = 0;
-  for (let y = border; y < h - border; y += 2) {
-    for (let x = border; x < w - border; x += 2) {
+  // 3px stride: this runs on the capture hot path, so keep it cheap
+  for (let y = border; y < h - border; y += 3) {
+    for (let x = border; x < w - border; x += 3) {
       const v = gray[y * w + x];
       const hi = v + fastThresh, lo = v - fastThresh;
       let brighter = 0, darker = 0;
@@ -92,7 +93,7 @@ export function countCorners(gray, w, h, fastThresh = 14) {
       if (best >= 9) n++;
     }
   }
-  return n; // sampled on a 2px grid, so roughly 1/4 of the true count
+  return n; // sampled on a 3px grid, so a fraction of the true corner count
 }
 
 export function detectAndDescribe(gray, w, h, {

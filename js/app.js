@@ -8,7 +8,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.7.1';
+const APP_VERSION = '0.7.2';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -18,6 +18,7 @@ const MAX_SHOTS = 50;   // memory-bounded; ImageData is kept for the final blend
 const CAP_LONG = 800;   // long side kept for compositing
 const GRAY_LONG = 512;  // long side used for feature detection
 const CAP_STEP = 14 * Math.PI / 180; // grab a frame every ~14° of pan (overlap guarantee)
+const FEAT_MIN = 7;     // capture-time corner floor (countCorners samples a 3px grid)
 
 const state = {
   stream: null,
@@ -205,13 +206,14 @@ function stashShot(manual) {
   const feat = countCorners(gray, sm.w, sm.h);
   state._lastFeat = feat;
   // reject frames the stitcher can't use — blur, blank wall, too dark
-  if (!manual && feat < 14) { $('hint').textContent = 'Too little detail / too blurry here'; return false; }
+  if (!manual && feat < FEAT_MIN) { $('hint').textContent = 'Too little detail / too blurry here'; return false; }
 
   const sharp = sharpness(gray, sm.w, sm.h); // for near-duplicate eviction
   const big = grabFrame(CAP_LONG, vw, vh);
   state.shots.push({
     imgData: big.data, w: big.w, h: big.h,
     gray, gw: sm.w, gh: sm.h, sharp, feat,
+    speed: state.speed, t: Math.round(performance.now()),
     quat: state.quat.slice(), hfovDeg: state.hfovDeg,
   });
   if (state.shots.length > MAX_SHOTS) {
@@ -233,10 +235,16 @@ function doCapture(manual) {
   if (!video.videoWidth) return false;
   updateOrientation(); // capture against the freshest pose
   const { tanX, tanY } = fovTangents();
+  // Always mark the attempt, pass or fail. A rejected grab used to leave
+  // lastCapQuat alone, so the displacement trigger stayed armed and re-ran the
+  // (expensive) readback + corner scan on EVERY animation frame — which
+  // collapsed the frame rate, stalled the dot ring, and made the next frames
+  // blurrier because the sweep ran on between grabs.
+  state.lastCapQuat = state.quat;
+  state._lastGrabT = performance.now();
   const ok = stashShot(manual);                                   // for the real stitch on Done
   if (!ok) return false;
   state.engine.splat(video, state.R, tanX, tanY, state.vidRot);   // live guide preview
-  state.lastCapQuat = state.quat;
   const s = $('btn-shutter');
   s.classList.remove('flash');
   void s.offsetWidth;
@@ -249,13 +257,14 @@ function doCapture(manual) {
 // A lattice of dots on the sphere, spaced ~60% of the field of view so
 // neighbouring shots overlap enough to stitch. Sized to the current FOV.
 function buildTargets() {
-  // Sparse sweep guide only — 3 rings, no pole caps. Coverage comes from the
-  // ~18° displacement grabs as you sweep between dots; the true poles are
-  // filled in software.
+  // Three rings, no pole caps (the caps are filled in software). Dots sit
+  // ~30° apart, which is ~35% overlap on the ~46° lens these phones actually
+  // have — the earlier 45° spacing left adjacent shots barely touching, which
+  // is why the match graph kept fragmenting.
   const rings = [
-    { p: 0, n: 8 },
-    { p: 42, n: 6 },
-    { p: -42, n: 6 },
+    { p: 0, n: 12 },
+    { p: 38, n: 9 },
+    { p: -38, n: 9 },
   ];
   const T = [];
   rings.forEach((r, ri) => {
@@ -331,38 +340,47 @@ function updateGuidance(now) {
   state.activeTarget = act;
 
   const CONE = 10 * DEG, FILL = 0.6;
-  const markNearbyDot = () => {
-    if (act >= 0 && state.targets[act]._ang < 16 * DEG) {
-      state.targets[act].done = true; state.targets[act].progress = 1;
-    }
-  };
 
-  // Frames are grabbed continuously as you sweep — every CAP_STEP of pan
-  // while the phone is moving slowly (not stopped, not whipping). Requiring a
-  // full stop meant a continuous sweep never triggered a grab, so neighbours
-  // ended up 45° apart on a ~42° lens and nothing overlapped.
+  // Frames are grabbed as you sweep, every CAP_STEP of pan. Motion blur is the
+  // thing that kills feature matching, so rather than grabbing the instant the
+  // step is reached, wait for the next slow moment (hands always micro-pause)
+  // and only force a grab if we've drifted well past the step. Costs nothing
+  // extra and biases every frame toward the sharpest instant available.
   const movedSince = state.lastCapQuat ? quatAngle(state.quat, state.lastCapQuat) : Infinity;
-  const sweeping = state.speed < 0.45;         // < ~26°/s
+  const sweeping = state.speed < 0.28;           // < ~16°/s: blur stays small
+  const slowNow = state.speed < 0.12;            // < ~7°/s: a natural pause
+  const cooled = now - (state._lastGrabT || 0) > 180;
   let grabbed = false;
-  if (sweeping && state.shots.length < MAX_SHOTS && movedSince > CAP_STEP) {
-    if (doCapture(false)) { grabbed = true; markNearbyDot(); }
-  }
 
+  // A dot completes only by dwelling on it: hold the crosshair inside the
+  // cone, the phone settles (`steady`), the ring fills, and THAT is the shot.
+  // The dwell is what guarantees a blur-free frame at each guide point, so the
+  // grab there is unconditional — a plain wall still owes us its pixels.
   for (let i = 0; i < state.targets.length; i++) {
     const t = state.targets[i];
     if (t.done) continue;
     const on = i === act && t._ang < CONE && steady;
     t.progress = clamp(t.progress + (on ? dt / FILL : -dt / 0.3), 0, 1);
-    if (t.progress >= 1 && on && !grabbed && doCapture(false)) { t.done = true; t.progress = 1; grabbed = true; }
+    if (t.progress >= 1 && on) {
+      doCapture(true);              // deliberate: never rejected
+      t.done = true; t.progress = 1; grabbed = true;
+    }
+  }
+
+  // Extra in-between frames while sweeping from dot to dot, purely to keep
+  // neighbours overlapping. These are feature-gated and never tick a dot off.
+  if (!grabbed && state.shots.length < MAX_SHOTS && cooled && sweeping &&
+      (movedSince > CAP_STEP * 1.7 || (movedSince > CAP_STEP && slowNow))) {
+    if (doCapture(false)) grabbed = true;
   }
 
   const done = state.targets.filter((t) => t.done).length;
   const lf = state._lastFeat;
   $('coverage').textContent =
-    `${state.shots.length}f` + (lf != null ? ` · ${lf < 14 ? '⚠' : ''}${lf}` : '');
+    `${state.shots.length}f` + (lf != null ? ` · ${lf < FEAT_MIN * 2 ? '⚠' : ''}${lf}` : '');
   if (state.shots.length >= MAX_SHOTS) hint.textContent = 'Plenty of frames — tap Done';
   else if (done === state.targets.length) hint.textContent = 'Dots done — a pass up & down, then Done';
-  else if (state.speed >= 0.45) hint.textContent = 'Slow down a little';
+  else if (state.speed >= 0.28) hint.textContent = 'Slow down — motion blur';
   else if (grabbed && lf != null && lf < 20) hint.textContent = 'Aim at more textured things';
   else hint.textContent = 'Sweep slowly toward the next dot';
 }
@@ -471,11 +489,15 @@ async function start() {
   window.addEventListener('deviceorientation', onOrient, true);
 
   try {
+    // A 60 fps stream forces the sensor to expose at <= 1/60 s, which roughly
+    // halves motion blur versus the 1/30 s an indoor 30 fps stream will pick —
+    // and motion blur is what destroys the corners the stitcher matches on.
     state.stream = await navigator.mediaDevices.getUserMedia({
       audio: false,
       video: {
         facingMode: { ideal: 'environment' },
         width: { ideal: 1920 }, height: { ideal: 1080 },
+        frameRate: { ideal: 60, min: 30 },
       },
     });
   } catch (e) {
@@ -625,7 +647,7 @@ function saveDebugData() {
     stitchLog: state._stitchLog || [],
     shots: state.shots.map((s) => ({
       gw: s.gw, gh: s.gh, w: s.w, h: s.h, quat: s.quat, hfovDeg: s.hfovDeg,
-      sharp: s.sharp, feat: s.feat, grayB64: b64(s.gray),
+      sharp: s.sharp, feat: s.feat, speed: s.speed, t: s.t, grayB64: b64(s.gray),
     })),
   };
   const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });

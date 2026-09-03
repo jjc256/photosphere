@@ -48,6 +48,17 @@ console.log('  median', gaps.slice().sort((a, b) => a - b)[gaps.length >> 1]?.to
   ' max', Math.max(...gaps).toFixed(0));
 console.log('');
 
+// capture-time speed vs how matchable the frame turned out (blur check)
+if (d.shots[0] && d.shots[0].speed != null) {
+  const rows = d.shots.map((s, i) => ({ i, deg: (s.speed || 0) * 180 / Math.PI, feat: s.feat }));
+  const slow = rows.filter((r) => r.deg < 8), fast = rows.filter((r) => r.deg >= 8);
+  const avg = (a) => (a.length ? (a.reduce((s, r) => s + r.feat, 0) / a.length).toFixed(0) : '-');
+  console.log(`capture speed vs corners: <8deg/s n=${slow.length} avgFeat=${avg(slow)} | ` +
+    `>=8deg/s n=${fast.length} avgFeat=${avg(fast)}`);
+  console.log('  per-frame deg/s:', rows.map((r) => r.deg.toFixed(0)).join(' '));
+  console.log('');
+}
+
 const res = await stitch(shots, { onProgress: () => {} });
 res.log.forEach((l) => console.log('  ', l));
 console.log('\nconnected', res.connected.filter(Boolean).length + '/' + shots.length,
