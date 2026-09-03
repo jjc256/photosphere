@@ -385,6 +385,10 @@ async function toReview() {
   }
   state._stitchLog = result.log || [];
   console.log('[stitch]', ...(result.log || []));
+  const diag = $('stitch-diag');
+  diag.textContent = (result.log || []).join('\n');
+  diag.classList.toggle('err', !result.ok);
+  diag.hidden = result.ok;   // show automatically when it fell back; tap the chip to toggle
 
   try {
     if (result.ok) {
@@ -586,6 +590,7 @@ function wire() {
 
   // review: back / flat toggle / download / share
   $('btn-back').addEventListener('click', () => { stopReviewLoop(); state._lastFile = null; resume(); });
+  $('review-cov').addEventListener('click', () => { const d = $('stitch-diag'); d.hidden = !d.hidden; });
   $('btn-viewmode').addEventListener('click', () => {
     state.viewFlat = !state.viewFlat;
     $('btn-viewmode').textContent = state.viewFlat ? 'Sphere view' : 'Flat view';

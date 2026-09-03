@@ -93,23 +93,50 @@ export const matVec3 = (A, v) => [
 ];
 
 // ---- homography RANSAC (pair inlier check) --------------------------------
+// Smallest-eigenvalue eigenvector of a symmetric n×n matrix via cyclic Jacobi.
+function smallestEigenvector(M, n) {
+  const a = M.map((r) => r.slice());
+  const V = Array.from({ length: n }, (_, i) => { const r = new Array(n).fill(0); r[i] = 1; return r; });
+  for (let sweep = 0; sweep < 40; sweep++) {
+    let off = 0;
+    for (let p = 0; p < n; p++) for (let q = p + 1; q < n; q++) off += a[p][q] * a[p][q];
+    if (off < 1e-18) break;
+    for (let p = 0; p < n; p++) for (let q = p + 1; q < n; q++) {
+      if (Math.abs(a[p][q]) < 1e-15) continue;
+      const th = (a[q][q] - a[p][p]) / (2 * a[p][q]);
+      const t = Math.sign(th || 1) / (Math.abs(th) + Math.sqrt(th * th + 1));
+      const c = 1 / Math.sqrt(t * t + 1), s = t * c;
+      for (let k = 0; k < n; k++) {
+        const akp = a[k][p], akq = a[k][q];
+        a[k][p] = c * akp - s * akq;
+        a[k][q] = s * akp + c * akq;
+      }
+      for (let k = 0; k < n; k++) {
+        const apk = a[p][k], aqk = a[q][k];
+        a[p][k] = c * apk - s * aqk;
+        a[q][k] = s * apk + c * aqk;
+      }
+      for (let k = 0; k < n; k++) {
+        const vkp = V[k][p], vkq = V[k][q];
+        V[k][p] = c * vkp - s * vkq;
+        V[k][q] = s * vkp + c * vkq;
+      }
+    }
+  }
+  let best = 0;
+  for (let i = 1; i < n; i++) if (a[i][i] < a[best][best]) best = i;
+  return V.map((r) => r[best]);
+}
+
 function homographyDLT(pts) {
-  // pts: [[x1,y1,x2,y2], ...] length 4; normalized already
-  const A = [];
-  for (const [x, y, u, v] of pts) {
-    A.push([-x, -y, -1, 0, 0, 0, u * x, u * y, u]);
-    A.push([0, 0, 0, -x, -y, -1, v * x, v * y, v]);
-  }
-  // solve A h = 0 via inverse-iteration on AtA
+  // pts: [[x1,y1,x2,y2], ...]; normalized already. Solve A h = 0.
   const AtA = Array.from({ length: 9 }, () => new Array(9).fill(0));
-  for (const row of A) for (let i = 0; i < 9; i++) for (let j = 0; j < 9; j++) AtA[i][j] += row[i] * row[j];
-  let h = new Array(9).fill(1);
-  for (let it = 0; it < 60; it++) {
-    const y = solveSPD(AtA.map((r, i) => r.map((v, j) => v + (i === j ? 1e-8 : 0))), h, 9);
-    const n = Math.hypot(...y) || 1;
-    h = y.map((v) => v / n);
+  const add = (row) => { for (let i = 0; i < 9; i++) for (let j = 0; j < 9; j++) AtA[i][j] += row[i] * row[j]; };
+  for (const [x, y, u, v] of pts) {
+    add([-x, -y, -1, 0, 0, 0, u * x, u * y, u]);
+    add([0, 0, 0, -x, -y, -1, v * x, v * y, v]);
   }
-  return h;
+  return smallestEigenvector(AtA, 9);
 }
 export function ransacHomography(ptsA, ptsB, { iters = 400, thresh = 3, seed = 12345 } = {}) {
   const n = ptsA.length;

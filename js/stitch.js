@@ -40,14 +40,21 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   const feats = [];
   for (let i = 0; i < N; i++) {
     onProgress('features', i / N);
-    feats.push(detectAndDescribe(shots[i].gray, shots[i].w, shots[i].h));
+    feats.push(detectAndDescribe(shots[i].gray, shots[i].w, shots[i].h, { fastThresh: 14, maxFeatures: 800 }));
     await tick();
   }
   log.push('features: ' + feats.map((f) => f.kps.length).join(','));
 
-  // 2. IMU-adjacent candidate pairs (bounded fan-out)
-  const maxAng = Math.min(hfov * 1.05, 1.2);
+  // 2. candidate pairs: IMU-adjacent (bounded fan-out) + every consecutive pair
+  // (capture order tracks a sweep, and covers the case where the gyro is dead).
+  const maxAng = Math.min(hfov * 1.15, 1.4);
+  const seen = new Set();
   const cand = [];
+  const addPair = (i, j) => {
+    const a = Math.min(i, j), b = Math.max(i, j);
+    if (a === b || seen.has(a * N + b)) return;
+    seen.add(a * N + b); cand.push([a, b]);
+  };
   for (let i = 0; i < N; i++) {
     const near = [];
     for (let j = 0; j < N; j++) if (j !== i) {
@@ -55,23 +62,27 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
       if (a < maxAng) near.push([j, a]);
     }
     near.sort((p, q) => p[1] - q[1]);
-    for (const [j] of near.slice(0, 6)) if (i < j) cand.push([i, j]);
+    for (const [j] of near.slice(0, 7)) addPair(i, j);
   }
+  for (let i = 0; i + 1 < N; i++) { addPair(i, i + 1); addPair(i, Math.min(i + 2, N - 1)); }
 
   // 3. match + homography verification
   const verified = []; // { i, j, mc:[centered matches], inl, Ii, Ij, H }
   const focals = [];
+  let bestRaw = 0, bestInl = 0;
   for (let c = 0; c < cand.length; c++) {
     onProgress('matching', c / cand.length);
     const [i, j] = cand[c];
-    const raw = matchDescriptors(feats[i].desc, feats[j].desc, 0.8);
-    if (raw.length >= 15) {
+    const raw = matchDescriptors(feats[i].desc, feats[j].desc, 0.82);
+    bestRaw = Math.max(bestRaw, raw.length);
+    if (raw.length >= 10) {
       const pa = raw.map(([a]) => [feats[i].kps[a].x, feats[i].kps[a].y]);
       const pb = raw.map(([, b]) => [feats[j].kps[b].x, feats[j].kps[b].y]);
       const ca = pa.map((p) => [p[0] - cx, p[1] - cy]);
       const cb = pb.map((p) => [p[0] - cx, p[1] - cy]);
-      const { H, inliers } = ransacHomography(ca, cb, { iters: 400, thresh: 3 });
-      if (inliers.length >= 18 && H) {
+      const { H, inliers } = ransacHomography(ca, cb, { iters: 500, thresh: 3.5 });
+      bestInl = Math.max(bestInl, inliers.length);
+      if (inliers.length >= 12 && H) {
         const step = Math.max(1, Math.floor(inliers.length / 70));
         const mc = [];
         for (let k = 0; k < inliers.length; k += step) {
@@ -90,7 +101,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     }
     await tick();
   }
-  log.push(`verified pairs: ${verified.length}`);
+  log.push(`verified pairs: ${verified.length} (best raw matches ${bestRaw}, best inliers ${bestInl}, ${cand.length} pairs tried)`);
   if (verified.length === 0) return bail();
 
   // 4. focal length: median of the per-homography estimates
@@ -115,7 +126,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
       if (hSeed.every((x) => isFinite(x)) && off < 0.6) seed = hSeed;
     } catch { /* keep gyro seed */ }
     const { Rrel, rms, inl } = refineRelRot(seed, v.mc, focal);
-    if (rms < 3 && inl >= 15) { edges.push({ i: v.i, j: v.j, Rrel, w: Math.min(inl, 120) }); UF.union(v.i, v.j); }
+    if (rms < 4 && inl >= 10) { edges.push({ i: v.i, j: v.j, Rrel, w: Math.min(inl, 120) }); UF.union(v.i, v.j); }
     v.rms = rms;
     await tick();
   }
