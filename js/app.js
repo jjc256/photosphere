@@ -7,7 +7,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.4.4';
+const APP_VERSION = '0.5.0';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -16,7 +16,7 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const MAX_SHOTS = 32;   // memory-bounded; ImageData is kept for the final blend
 const CAP_LONG = 1024;  // long side kept for compositing
 const GRAY_LONG = 512;  // long side used for feature detection
-const SHARP_MIN = 4.0;  // mean |gradient| floor — below this a frame is too blurred to match
+const SHARP_MIN = 2.0;  // mean |gradient| floor — reject only badly motion-smeared frames
 
 const state = {
   stream: null,
@@ -247,13 +247,15 @@ function buildTargets() {
   const fov = state.hfovDeg || 55;
   // space dots ~80% of the FOV apart -> ~20% overlap between neighbours
   const eqN = clamp(Math.round(360 / (fov * 0.82)), 5, 10);
-  const midP = fov * 0.62, highP = Math.min(66, fov * 1.2);
+  const midP = fov * 0.55, highP = Math.min(64, fov * 1.15);
   const rings = [
     { p: 0, n: eqN },
-    { p: midP, n: Math.max(5, Math.round(eqN * 0.82)) },
-    { p: -midP, n: Math.max(5, Math.round(eqN * 0.82)) },
+    { p: midP, n: Math.max(5, Math.round(eqN * 0.8)) },
+    { p: -midP, n: Math.max(5, Math.round(eqN * 0.8)) },
     { p: highP, n: Math.max(3, Math.round(eqN * 0.42)) },
     { p: -highP, n: Math.max(3, Math.round(eqN * 0.42)) },
+    { p: 82, n: 3 },   // near-zenith cap (the last ~8° is filled in software)
+    { p: -82, n: 3 },  // near-nadir cap
   ];
   const T = [];
   rings.forEach((r, ri) => {
@@ -263,8 +265,6 @@ function buildTargets() {
       T.push({ dir: [cp * Math.sin(y), Math.sin(p), -cp * Math.cos(y)], done: false, progress: 0 });
     }
   });
-  T.push({ dir: [0, 1, 0], done: false, progress: 0 });   // straight up
-  T.push({ dir: [0, -1, 0], done: false, progress: 0 });   // straight down
   state.targets = T;
   state.activeTarget = -1;
 }
@@ -325,26 +325,26 @@ function updateGuidance(now) {
   state.activeTarget = act;
 
   const CONE = 8 * DEG, FILL = 0.85;
+  let stuck = false;
   for (let i = 0; i < state.targets.length; i++) {
     const t = state.targets[i];
     if (t.done) continue;
     const on = i === act && t._ang < CONE && steady;
     t.progress = clamp(t.progress + (on ? dt / FILL : -dt / 0.35), 0, 1);
-    if (t.progress >= 1) {
-      if (doCapture(false)) {
-        t.done = true; t.progress = 1;
-      } else {
-        // grab failed (blurred / camera not ready) — don't loop the ring forever
-        t.tries = (t.tries || 0) + 1;
-        t.progress = 0;
-        if (t.tries >= 2) t.done = true; // move on; the stitcher tolerates the gap
-      }
+    if (t.progress >= 1 && on) {
+      // ring full: keep trying every frame until a sharp grab lands — the ring
+      // just sits full rather than looping, and the dot stays open if you move on
+      if (doCapture(false)) { t.done = true; t.progress = 1; t.stuckFrames = 0; }
+      else { t.stuckFrames = (t.stuckFrames || 0) + 1; if (t.stuckFrames > 20) stuck = true; }
+    } else if (!on) {
+      t.stuckFrames = 0;
     }
   }
 
   const done = state.targets.filter((t) => t.done).length;
   $('coverage').textContent = `${done}/${state.targets.length}`;
   if (done === state.targets.length) hint.textContent = 'All dots captured — tap Done';
+  else if (stuck) hint.textContent = 'Too blurry here — steady the phone';
   else if (act >= 0 && state.targets[act]._ang < CONE) hint.textContent = steady ? 'Hold…' : 'Hold still';
   else hint.textContent = 'Aim at the nearest dot';
 }
@@ -525,11 +525,14 @@ async function toReview() {
       const s0 = state.shots[0];
       const tanX = Math.tan((state.hfovDeg * DEG) / 2) / result.focalScale;
       const tanY = tanX * (s0.h / s0.w);
-      state.engine.compositeStitched(
-        state.shots.map((s, k) => ({ img: s.imgData, R: result.rotations[k], gain: result.gains[k] })),
-        tanX, tanY,
-      );
-      const nConn = result.connected.filter(Boolean).length;
+      // composite only the aligned frames (a mis-posed loose frame is worse
+      // than a small gap); fall back to all if too few connected
+      const parts = state.shots.map((s, k) => ({
+        img: s.imgData, R: result.rotations[k], gain: result.gains[k], conn: result.connected[k],
+      }));
+      const conn = parts.filter((p) => p.conn);
+      state.engine.compositeStitched(conn.length >= 3 ? conn : parts, tanX, tanY);
+      const nConn = conn.length;
       if (nConn < state.shots.length) toast(`Aligned ${nConn} of ${state.shots.length} frames`);
     } else {
       state.engine.bake(); // gyro-only fallback (from the live splat accumulation)

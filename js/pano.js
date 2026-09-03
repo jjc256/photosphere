@@ -115,60 +115,105 @@ bool warp(out vec3 rgb, out float edge) {
   if (max(abs(px), abs(py)) > 1.0) return false;
   vec2 uv = vec2(px, py) * 0.5 + 0.5;
   rgb = clamp(texture(uFrame, uv).rgb * uGain, 0.0, 1.0);
-  edge = clamp(min(1.0 - abs(px), 1.0 - abs(py)) * 3.0, 0.0, 1.0);
+  edge = min(1.0 - abs(px), 1.0 - abs(py));   // distance to nearest frame edge, 0..1
   return true;
 }`;
 
-const WARP_LO_FRAG = WARP_HEAD + `
+// Seam labelling: nearest-centre (Voronoi) wins via the depth buffer.
+// Output R = (frameIndex+1)/255, G = border distance.
+const LABEL_FRAG = WARP_HEAD + `
 out vec4 frag;
+uniform float uIndex;
 void main() {
   vec3 rgb; float edge;
   if (!warp(rgb, edge)) discard;
-  float w = smoothstep(0.0, 0.6, edge) + 1e-3;
-  frag = vec4(rgb * w, w);
+  gl_FragDepth = 1.0 - edge * 0.999;    // higher border distance -> smaller depth -> wins
+  frag = vec4((uIndex + 1.0) / 255.0, edge, 0.0, 1.0);
 }`;
 
-const WARP_WIN_FRAG = WARP_HEAD + `
+// Binary mask: 1 where this frame owns the seam label, else 0.
+const MASK_FRAG = `#version 300 es
+precision highp float;
+in vec2 vUv;
 out vec4 frag;
+uniform sampler2D uLabel;
+uniform float uWant;                    // frameIndex+1
 void main() {
-  vec3 rgb; float edge;
-  if (!warp(rgb, edge)) discard;
-  gl_FragDepth = 1.0 - edge;            // higher edge distance wins (depth LESS)
-  frag = vec4(rgb, 1.0);
+  float lab = texture(uLabel, vUv).r * 255.0;
+  frag = vec4(abs(lab - uWant) < 0.5 ? 1.0 : 0.0);
 }`;
 
+// Separable blur (13-tap gaussian, scaled by uStep).
 const BLUR_FRAG = `#version 300 es
 precision highp float;
 in vec2 vUv;
 out vec4 frag;
 uniform sampler2D uSrc;
-uniform vec2 uStep;                     // texel * direction * spread
+uniform vec2 uStep;
 void main() {
   float wsum = 0.0;
-  vec3 acc = vec3(0.0);
+  vec4 acc = vec4(0.0);
   for (int i = -6; i <= 6; i++) {
     float w = exp(-float(i * i) / 18.0);
-    acc += texture(uSrc, vUv + uStep * float(i)).rgb * w;
+    acc += texture(uSrc, vUv + uStep * float(i)) * w;
     wsum += w;
   }
-  frag = vec4(acc / wsum, 1.0);
+  frag = acc / wsum;
 }`;
 
-const COMBINE_FRAG = `#version 300 es
+// Warp frame k and weight it by the blurred ownership mask -> additive accum.
+const WARP_ACCUM_FRAG = WARP_HEAD + `
+out vec4 frag;
+uniform sampler2D uWeight;
+void main() {
+  vec3 rgb; float edge;
+  if (!warp(rgb, edge)) discard;        // only where the frame actually covers
+  float w = texture(uWeight, vUv).r;
+  if (w <= 0.0) discard;
+  frag = vec4(rgb * w, w);
+}`;
+
+// Normalise the accum buffer; alpha carries coverage (1 = real imagery).
+const NORMALIZE2_FRAG = `#version 300 es
 precision highp float;
 in vec2 vUv;
 out vec4 frag;
-uniform sampler2D uLo;      // feathered blend, normalised (low freq, exposure)
-uniform sampler2D uWin;     // seam-winner full colour
-uniform sampler2D uWinLo;   // blurred winner (low freq of the winner)
-uniform float uFlipY;
+uniform sampler2D uAccum;
 void main() {
-  vec2 uv = vec2(vUv.x, uFlipY > 0.5 ? 1.0 - vUv.y : vUv.y);
-  vec3 lo = texture(uLo, uv).rgb;
-  vec3 win = texture(uWin, uv).rgb;
-  vec3 winLo = texture(uWinLo, uv).rgb;
-  vec3 c = lo + (win - winLo);          // 2-band Laplacian blend
-  frag = vec4(clamp(c, 0.0, 1.0), 1.0);
+  vec4 a = texture(uAccum, vUv);
+  if (a.a > 1e-4) frag = vec4(a.rgb / a.a, 1.0);
+  else frag = vec4(0.0, 0.0, 0.0, 0.0);
+}`;
+
+// Fill uncovered caps: for a black texel, borrow the nearest covered texel
+// along the same meridian (a few marches converge the poles).
+const POLEFILL_FRAG = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 frag;
+uniform sampler2D uSrc;
+uniform vec2 uTexel;
+// average a covered row across longitude so the cap fill is a smooth wash,
+// not per-column streaks
+vec4 rowAvg(float y) {
+  vec3 acc = vec3(0.0); float n = 0.0;
+  for (int i = -8; i <= 8; i++) {
+    vec4 s = texture(uSrc, vec2(vUv.x + float(i) * uTexel.x * 4.0, y));
+    if (s.a > 0.5) { acc += s.rgb; n += 1.0; }
+  }
+  return n > 0.0 ? vec4(acc / n, 1.0) : vec4(0.0);
+}
+void main() {
+  vec4 c = texture(uSrc, vUv);
+  if (c.a > 0.5) { frag = c; return; }
+  for (int k = 1; k <= 20; k++) {
+    float o = float(k) * uTexel.y * 5.0;
+    vec4 up = rowAvg(vUv.y + o);
+    if (up.a > 0.5) { frag = up; return; }
+    vec4 dn = rowAvg(vUv.y - o);
+    if (dn.a > 0.5) { frag = dn; return; }
+  }
+  frag = c;
 }`;
 
 const BLIT_FRAG = `#version 300 es
@@ -228,10 +273,12 @@ export class PanoEngine {
     this.pPresent = program(gl, PRESENT_FRAG);
     this.pSphere = program(gl, SPHERE_FRAG);
     this.pCoverage = program(gl, COVERAGE_FRAG);
-    this.pWarpLo = program(gl, WARP_LO_FRAG);
-    this.pWarpWin = program(gl, WARP_WIN_FRAG);
+    this.pLabel = program(gl, LABEL_FRAG);
+    this.pMask = program(gl, MASK_FRAG);
     this.pBlur = program(gl, BLUR_FRAG);
-    this.pCombine = program(gl, COMBINE_FRAG);
+    this.pWarpAcc = program(gl, WARP_ACCUM_FRAG);
+    this.pNorm2 = program(gl, NORMALIZE2_FRAG);
+    this.pPole = program(gl, POLEFILL_FRAG);
     this.pBlit = program(gl, BLIT_FRAG);
     this._composited = false;
 
@@ -471,29 +518,33 @@ export class PanoEngine {
     return cvs;
   }
 
-  // ---- multi-band stitched compositor ------------------------------------
+  // ---- seam-based stitched compositor ----------------------------------
+  // Nearest-centre (Voronoi) seam labels, then blend frames weighted by a
+  // blurred ownership mask so away from a seam exactly ONE frame contributes
+  // (no N-way averaging -> no ghosting / "flower" at the poles), and across a
+  // seam only its two neighbours cross-fade. Then fill the uncovered caps.
   _initComposite() {
-    if (this._loFbo) return;
+    if (this._accumFbo) return;
     const gl = this.gl, w = this.size, h = this.h;
     const hf = this._floatLinear ? gl.LINEAR : gl.NEAREST;
     this.frameTex = this._tex(4, 4, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.CLAMP_TO_EDGE);
-    this.loTex = this._tex(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, hf, gl.REPEAT);
-    this.loFbo = this._fbo(this.loTex);
-    this.winTex = this._tex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.REPEAT);
-    this.winFbo = gl.createFramebuffer();
-    this.winDepth = gl.createRenderbuffer();
-    gl.bindRenderbuffer(gl.RENDERBUFFER, this.winDepth);
+    this.accumTex = this._compAccum = this._tex(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, hf, gl.REPEAT);
+    this._accumFbo = this._fbo(this.accumTex);
+    this.labelTex = this._tex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST, gl.REPEAT);
+    this.labelFbo = gl.createFramebuffer();
+    this.labelDepth = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, this.labelDepth);
     gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.winFbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.winTex, 0);
-    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, this.winDepth);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.labelFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.labelTex, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, this.labelDepth);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    this.tmpTex = this._tex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.REPEAT);
-    this.tmpFbo = this._fbo(this.tmpTex);
-    this.tmp2Tex = this._tex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.REPEAT);
-    this.tmp2Fbo = this._fbo(this.tmp2Tex);
-    this.winSmoothTex = this._tex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.REPEAT);
-    this.winSmoothFbo = this._fbo(this.winSmoothTex);
+    this.mA = this._tex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.REPEAT);
+    this.mAf = this._fbo(this.mA);
+    this.mB = this._tex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.REPEAT);
+    this.mBf = this._fbo(this.mB);
+    this.mC = this._tex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.REPEAT);
+    this.mCf = this._fbo(this.mC);
   }
 
   _uploadFrame(img) {
@@ -504,105 +555,113 @@ export class PanoEngine {
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
   }
 
-  _blurInto(srcTex, dstFbo, spread) {
+  _warpUniforms(prog, uRot, tanX, tanY, gain) {
+    const gl = this.gl;
+    gl.uniformMatrix3fv(gl.getUniformLocation(prog, 'uRot'), false, uRot);
+    gl.uniform2f(gl.getUniformLocation(prog, 'uTan'), tanX, tanY);
+    gl.uniform1f(gl.getUniformLocation(prog, 'uGain'), gain);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
+    gl.uniform1i(gl.getUniformLocation(prog, 'uFrame'), 0);
+  }
+
+  // src -> mA (blurred), separable, ping-ponging through mB.
+  _blur(srcTex, spread) {
     const gl = this.gl, w = this.size, h = this.h;
     gl.useProgram(this.pBlur);
     gl.disable(gl.BLEND);
-    // H pass: src -> tmp2
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.tmp2Fbo);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.mBf);
     gl.viewport(0, 0, w, h);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, srcTex);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, srcTex);
     gl.uniform1i(gl.getUniformLocation(this.pBlur, 'uSrc'), 0);
     gl.uniform2f(gl.getUniformLocation(this.pBlur, 'uStep'), spread / w, 0);
     this._quad();
-    // V pass: tmp2 -> dst
-    gl.bindFramebuffer(gl.FRAMEBUFFER, dstFbo);
-    gl.viewport(0, 0, w, h);
-    gl.bindTexture(gl.TEXTURE_2D, this.tmp2Tex);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.mAf);
+    gl.bindTexture(gl.TEXTURE_2D, this.mB);
     gl.uniform2f(gl.getUniformLocation(this.pBlur, 'uStep'), 0, spread / h);
     this._quad();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
-  // frames: [{ img, R (row-major camera->world), gain }]. tanX/tanY: tan(fov/2)
-  // for the focal-corrected lens. Re-projects every frame with its solved pose
-  // via the proven splat pipeline (feathered weighted average) and bakes the
-  // result into panoTex. Frames are drawn most-central-last so tie regions
-  // favour well-exposed centres.
+  // frames: [{ img, R (row-major camera->world), gain }]; tanX/tanY = tan(fov/2)
+  // for the focal-corrected lens. Fills panoTex.
   compositeStitched(frames, tanX, tanY) {
-    this.clear();
-    const gl = this.gl;
-    for (const fr of frames) {
-      this.splat(fr.img, matT3col(fr.R), tanX, tanY, 0, 0.28, fr.gain || 1);
-    }
-    this.bake();
-    this._composited = true;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  }
-
-  // (kept for a future device-tested pass) multi-band seam blend
-  compositeMultiBand(frames, tanX, tanY) {
     const gl = this.gl, w = this.size, h = this.h;
     this._initComposite();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.loFbo);
+    const rots = frames.map((f) => matT3col(f.R));
+
+    // pass 1: seam labels (nearest centre wins via depth)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.labelFbo);
+    gl.viewport(0, 0, w, h);
+    gl.disable(gl.BLEND);
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.depthMask(true);
+    gl.clearColor(0, 0, 0, 0); gl.clearDepth(1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.useProgram(this.pLabel);
+    frames.forEach((fr, k) => {
+      this._uploadFrame(fr.img);
+      this._warpUniforms(this.pLabel, rots[k], tanX, tanY, fr.gain || 1);
+      gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uIndex'), k);
+      this._quad();
+    });
+    gl.disable(gl.DEPTH_TEST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    // pass 2: per frame -> ownership mask -> blur -> weighted accumulate
+    const spread = Math.max(8, w / 90);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._accumFbo);
     gl.viewport(0, 0, w, h); gl.disable(gl.BLEND);
     gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.winFbo);
-    gl.viewport(0, 0, w, h);
-    gl.clearColor(0.01, 0.01, 0.015, 1); gl.clearDepth(1.0);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    for (const fr of frames) {
-      const uRot = matT3col(fr.R);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    frames.forEach((fr, k) => {
+      // mask == k  -> mA
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.mAf);
+      gl.viewport(0, 0, w, h); gl.disable(gl.BLEND);
+      gl.useProgram(this.pMask);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.labelTex);
+      gl.uniform1i(gl.getUniformLocation(this.pMask, 'uLabel'), 0);
+      gl.uniform1f(gl.getUniformLocation(this.pMask, 'uWant'), k + 1);
+      this._quad();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+      this._blur(this.mA, spread);        // blurred weight -> mA
+
+      // warp frame k, weight by mA, add into accum
       this._uploadFrame(fr.img);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.winFbo);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this._accumFbo);
       gl.viewport(0, 0, w, h);
-      gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.depthMask(true);
-      gl.disable(gl.BLEND);
-      gl.useProgram(this.pWarpWin);
-      gl.uniformMatrix3fv(gl.getUniformLocation(this.pWarpWin, 'uRot'), false, uRot);
-      gl.uniform2f(gl.getUniformLocation(this.pWarpWin, 'uTan'), tanX, tanY);
-      gl.uniform1f(gl.getUniformLocation(this.pWarpWin, 'uGain'), fr.gain || 1);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
-      gl.uniform1i(gl.getUniformLocation(this.pWarpWin, 'uFrame'), 0);
-      this._quad();
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.loFbo);
-      gl.viewport(0, 0, w, h);
-      gl.disable(gl.DEPTH_TEST);
       gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD); gl.blendFunc(gl.ONE, gl.ONE);
-      gl.useProgram(this.pWarpLo);
-      gl.uniformMatrix3fv(gl.getUniformLocation(this.pWarpLo, 'uRot'), false, uRot);
-      gl.uniform2f(gl.getUniformLocation(this.pWarpLo, 'uTan'), tanX, tanY);
-      gl.uniform1f(gl.getUniformLocation(this.pWarpLo, 'uGain'), fr.gain || 1);
-      gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
-      gl.uniform1i(gl.getUniformLocation(this.pWarpLo, 'uFrame'), 0);
+      gl.useProgram(this.pWarpAcc);
+      this._warpUniforms(this.pWarpAcc, rots[k], tanX, tanY, fr.gain || 1);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.mA);
+      gl.uniform1i(gl.getUniformLocation(this.pWarpAcc, 'uWeight'), 1);
       this._quad();
       gl.disable(gl.BLEND);
-    }
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.tmpFbo);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    });
+
+    // normalise -> mC (rgb + coverage alpha)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.mCf);
     gl.viewport(0, 0, w, h); gl.disable(gl.BLEND);
-    gl.useProgram(this.pPresent);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.loTex);
-    gl.uniform1i(gl.getUniformLocation(this.pPresent, 'uAccum'), 0);
-    gl.uniform1f(gl.getUniformLocation(this.pPresent, 'uFlipY'), 0);
+    gl.useProgram(this.pNorm2);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.accumTex);
+    gl.uniform1i(gl.getUniformLocation(this.pNorm2, 'uAccum'), 0);
     this._quad();
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    const spread = Math.max(6, w / 220);
-    this._blurInto(this.tmpTex, this.tmpFbo, spread);
-    this._blurInto(this.winTex, this.winSmoothFbo, spread);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.panoFbo);
-    gl.viewport(0, 0, w, h); gl.disable(gl.BLEND);
-    gl.useProgram(this.pCombine);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tmpTex);
-    gl.uniform1i(gl.getUniformLocation(this.pCombine, 'uLo'), 0);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.winTex);
-    gl.uniform1i(gl.getUniformLocation(this.pCombine, 'uWin'), 1);
-    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.winSmoothTex);
-    gl.uniform1i(gl.getUniformLocation(this.pCombine, 'uWinLo'), 2);
-    gl.uniform1f(gl.getUniformLocation(this.pCombine, 'uFlipY'), 0);
-    this._quad();
+
+    // fill uncovered caps (mC -> mA -> mC ...), then land in panoTex
+    gl.useProgram(this.pPole);
+    gl.uniform2f(gl.getUniformLocation(this.pPole, 'uTexel'), 1 / w, 1 / h);
+    gl.uniform1i(gl.getUniformLocation(this.pPole, 'uSrc'), 0);
+    let src = this.mC, srcFbo = null;
+    for (let i = 0; i < 3; i++) {
+      const dstFbo = i === 2 ? this.panoFbo : (src === this.mC ? this.mAf : this.mCf);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, dstFbo);
+      gl.viewport(0, 0, w, h); gl.disable(gl.BLEND);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src);
+      this._quad();
+      src = src === this.mC ? this.mA : this.mC;
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.activeTexture(gl.TEXTURE0);
     this._composited = true;
