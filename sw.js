@@ -1,5 +1,5 @@
 // Minimal app-shell service worker: offline-capable, cache-first for static assets.
-const CACHE = 'photosphere-v3';
+const CACHE = 'photosphere-v4';
 const ASSETS = [
   './',
   './index.html',
