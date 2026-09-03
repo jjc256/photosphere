@@ -7,7 +7,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.4.3';
+const APP_VERSION = '0.4.4';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -245,14 +245,15 @@ function doCapture(manual) {
 // neighbouring shots overlap enough to stitch. Sized to the current FOV.
 function buildTargets() {
   const fov = state.hfovDeg || 55;
-  const eqN = clamp(Math.round(360 / (fov * 0.6)), 8, 16);
-  const midP = fov * 0.52, highP = Math.min(72, fov * 1.05);
+  // space dots ~80% of the FOV apart -> ~20% overlap between neighbours
+  const eqN = clamp(Math.round(360 / (fov * 0.82)), 5, 10);
+  const midP = fov * 0.62, highP = Math.min(66, fov * 1.2);
   const rings = [
     { p: 0, n: eqN },
-    { p: midP, n: Math.max(6, Math.round(eqN * 0.82)) },
-    { p: -midP, n: Math.max(6, Math.round(eqN * 0.82)) },
-    { p: highP, n: Math.max(4, Math.round(eqN * 0.5)) },
-    { p: -highP, n: Math.max(4, Math.round(eqN * 0.5)) },
+    { p: midP, n: Math.max(5, Math.round(eqN * 0.82)) },
+    { p: -midP, n: Math.max(5, Math.round(eqN * 0.82)) },
+    { p: highP, n: Math.max(3, Math.round(eqN * 0.42)) },
+    { p: -highP, n: Math.max(3, Math.round(eqN * 0.42)) },
   ];
   const T = [];
   rings.forEach((r, ri) => {
@@ -315,6 +316,12 @@ function updateGuidance(now) {
     t._ang = Math.acos(clamp(aim[0] * t._w[0] + aim[1] * t._w[1] + aim[2] * t._w[2], -1, 1));
     if (t._ang < actAng) { actAng = t._ang; act = i; }
   }
+  // hysteresis: don't hop to a new active dot unless it's clearly closer
+  const prev = state.activeTarget;
+  if (prev >= 0 && prev < state.targets.length && !state.targets[prev].done &&
+      state.targets[prev]._ang < actAng + 4 * DEG) {
+    act = prev; actAng = state.targets[prev]._ang;
+  }
   state.activeTarget = act;
 
   const CONE = 8 * DEG, FILL = 0.85;
@@ -324,8 +331,14 @@ function updateGuidance(now) {
     const on = i === act && t._ang < CONE && steady;
     t.progress = clamp(t.progress + (on ? dt / FILL : -dt / 0.35), 0, 1);
     if (t.progress >= 1) {
-      if (doCapture(false)) { t.done = true; t.progress = 1; }
-      else { t.progress = 0.4; }
+      if (doCapture(false)) {
+        t.done = true; t.progress = 1;
+      } else {
+        // grab failed (blurred / camera not ready) — don't loop the ring forever
+        t.tries = (t.tries || 0) + 1;
+        t.progress = 0;
+        if (t.tries >= 2) t.done = true; // move on; the stitcher tolerates the gap
+      }
     }
   }
 
@@ -346,6 +359,7 @@ function drawGuide() {
   if (!state.R0 || !state.targets.length) return;
 
   const { tanX, tanY } = fovTangents();
+  const aim = forwardDir(state.R);
   const project = (w) => {
     const c = worldToCam(state.R, w);
     if (c[2] >= -1e-3) return null;
@@ -355,13 +369,17 @@ function drawGuide() {
 
   for (let i = 0; i < state.targets.length; i++) {
     const t = state.targets[i];
-    const w = t._w || refToWorld(state.R0, t.dir);
-    const p = project(w);
+    const w = refToWorld(state.R0, t.dir);
     const active = i === state.activeTarget;
+    // only show dots near where you're looking (like other apps)
+    const align = aim[0] * w[0] + aim[1] * w[1] + aim[2] * w[2];
+    if (!active && align < 0.34) continue; // ~beyond 70° off-axis
+    const p = project(w);
 
     if (t.done) {
-      if (!p || Math.abs(p.sx) > 1.15 || Math.abs(p.sy) > 1.15) continue;
-      g.beginPath(); g.arc(p.x, p.y, 5 * dpr, 0, 7); g.fillStyle = 'rgba(51,210,155,0.55)'; g.fill();
+      if (p && Math.abs(p.sx) <= 1.15 && Math.abs(p.sy) <= 1.15) {
+        g.beginPath(); g.arc(p.x, p.y, 5 * dpr, 0, 7); g.fillStyle = 'rgba(51,210,155,0.5)'; g.fill();
+      }
       continue;
     }
 
