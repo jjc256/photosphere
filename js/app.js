@@ -8,7 +8,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.7.3';
+const APP_VERSION = '0.8.0';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -577,7 +577,7 @@ async function toReview() {
         weak: nConn >= 3 && !result.connected[k],
         vidRot: s.vidRot,
       }));
-      state.engine.compositeStitched(parts, tanX, tanY);
+      state.engine.compositeStitched(parts, tanX, tanY, result.k1 || 0);
       if (nConn < state.shots.length) toast(`Aligned ${nConn} of ${state.shots.length} frames`);
     } else {
       state.engine.bake(); // gyro-only fallback (from the live splat accumulation)

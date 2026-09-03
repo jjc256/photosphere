@@ -69,9 +69,9 @@ the rare browser that hands the camera feed sideways.
 | Piece | What it does |
 |---|---|
 | `js/orientation.js` | Turns iOS `deviceorientation` (`alpha/beta/gamma` + screen angle) into a camera→world rotation matrix (three.js `DeviceOrientationControls` math). |
-| `js/orb.js` | Compact **ORB**: FAST-9 corners + non-max suppression, oriented BRIEF-256 descriptors, Hamming matcher with Lowe ratio test + cross-check. |
-| `js/ba.js` | Geometry back-end: SO(3) exp/log, homography RANSAC, **focal length from the homographies** (OpenCV `focalsFromHomography`), per-pair relative-rotation refinement (L2 Levenberg–Marquardt + IRLS outlier re-filter), **global L2 rotation averaging** anchored to the IMU, and **gain compensation**. |
-| `js/stitch.js` | Runs once on **Done**: detect features → match IMU-adjacent pairs → RANSAC-verify → median focal → refine each pair's rotation → keep the largest connected component → rotation-average → gain-compensate. Frames it can't connect keep their gyro pose; if matching is too weak overall it falls back to gyro alignment wholesale. |
+| `js/orb.js` | Compact **multi-scale ORB**: FAST-9 corners + non-max suppression over a 3-octave pyramid (a motion-blurred frame keeps coarse structure even when fine corners are gone), oriented BRIEF-256 descriptors, Hamming matcher with Lowe ratio test + cross-check. |
+| `js/ba.js` | Geometry back-end: SO(3) exp/log, homography RANSAC, **focal length from the homographies** (OpenCV `focalsFromHomography`), a **radial lens model** (`x_d = x_u(1 + k₁r_u²)`, Brown) with both directions, per-pair relative-rotation refinement (L2 Levenberg–Marquardt + IRLS outlier re-filter), **global L2 rotation averaging** anchored to the IMU, and **gain compensation**. |
+| `js/stitch.js` | Runs once on **Done**: detect features → match IMU-adjacent pairs → RANSAC-verify → median focal → **calibrate the lens** (solve k₁ and polish the focal by minimising total pairwise reprojection error) → refine each pair's rotation → rotation-average **every match cluster** → gain-compensate. Frames it can't connect keep their gyro pose; if matching is too weak overall it falls back to gyro alignment wholesale. |
 | `js/pano.js` | WebGL2 engine. `splat()` drives the live capture preview. `compositeStitched()` runs the standard stitcher compositing chain: warp every frame to the sphere → build a consensus mosaic → **content-aware seam labels** (border distance minus a blurred photometric-disagreement term, a cheap stand-in for Kwatra graph-cut seams, resolved with the depth buffer) → **Burt–Adelson multi-band blend** (each source's detail band weighted by its mask blurred narrowly, its base band by the same mask blurred widely) → pole fill → upscale to `panoTex`. Also the interactive sphere view and equirect read-back for export. |
 | `js/xmp.js` | Builds the GPano XMP packet and splices metadata segments into the JPEG (EXIF then XMP, after `APP0`). |
 | `js/exif.js` | Hand-rolled big-endian **EXIF `APP1`** writer — GPS position, capture time, view direction — the tags Google Maps / Street View needs. |
@@ -81,7 +81,11 @@ the rare browser that hands the camera feed sideways.
 Stitching is **feature-based, seeded by the IMU**: the gyroscope gives a global
 first guess for every frame at once (no incremental drift), then ORB matches +
 rotation averaging pull the frames into photometric agreement and recover the
-true focal length. The device gyro is the fallback at every level — an
+lens — both focal length and radial distortion. Solving distortion matters more
+than it sounds: assuming a pinhole not only leaves residual error at the frame
+edges (exactly where seams land) but also biases the focal estimate badly — on a
+synthetic lens with k₁ = −0.18 the homography focal comes out 39% wrong, and
+recovers to 0.3% once k₁ is solved. The device gyro is the fallback at every level — an
 unmatched frame, or a capture with too little overlap, still lands roughly
 right. Shoot from **one spot** (pivot around yourself); parallax from close
 objects is the residual limit that a pure-rotation model can't remove.

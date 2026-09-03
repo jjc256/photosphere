@@ -255,19 +255,47 @@ export function relRotFromHomography(H, f) {
   return [u0[0], u1[0], u2[0], u0[1], u1[1], u2[1], u0[2], u1[2], u2[2]];
 }
 
+// ---- lens model -----------------------------------------------------------
+// Phone lenses are not pinholes. A single radial term x_d = x_u(1 + k1*r_u^2)
+// (Brown, focal-normalised) captures most of it. Without this the reprojection
+// error grows toward the frame edges - which is exactly where seams land - so
+// pairs fit worse, more get rejected, and the ones that pass still misalign at
+// the seam. k1 < 0 is barrel.
+export function distortPt(x, y, k1) {
+  if (!k1) return [x, y];
+  const s = 1 + k1 * (x * x + y * y);
+  return [x * s, y * s];
+}
+export function undistortPt(x, y, k1) {
+  const rd2 = x * x + y * y;
+  if (!k1 || rd2 < 1e-14) return [x, y];
+  let ru2 = rd2;
+  for (let i = 0; i < 5; i++) { const s = 1 + k1 * ru2; ru2 = rd2 / (s * s); }
+  const s = 1 + k1 * ru2;
+  return [x / s, y / s];
+}
+
 // Gauss-Newton refine of ONE relative rotation Rrel (cam_i ray -> cam_j ray)
 // so that x_j ≈ project(Rrel · Kinv x_i). m0: [[xi,yi,xj,yj]] centered pixels.
 // Runs LM, drops gross mismatches that slipped past homography RANSAC
 // (periodic-texture false positives), then re-runs. Returns rms/inl on the
 // surviving inlier set.
-export function refineRelRot(Rrel0, m0, f, { iters = 20 } = {}) {
+export function refineRelRot(Rrel0, m0, f, { iters = 20, k1 = 0 } = {}) {
+  // measured pixels are distorted: lift to ideal rays, and push predictions
+  // back through the lens before comparing with the measured pixel.
+  const rays = new Map();
+  const ray = (m) => {
+    let r = rays.get(m);
+    if (!r) { const u = undistortPt(m[0] / f, m[1] / f, k1); r = [u[0], u[1], -1]; rays.set(m, r); }
+    return r;
+  };
   const perErr = (R, m) => {
     const e = new Float64Array(m.length);
     for (let k = 0; k < m.length; k++) {
-      const [xi, yi, xj, yj] = m[k];
-      const d = matVec3(R, [xi / f, yi / f, -1]);
+      const d = matVec3(R, ray(m[k]));
       const z = Math.min(d[2], -0.05);
-      e[k] = Math.hypot(-f * d[0] / z - xj, -f * d[1] / z - yj);
+      const p = distortPt(-d[0] / z, -d[1] / z, k1);
+      e[k] = Math.hypot(f * p[0] - m[k][2], f * p[1] - m[k][3]);
     }
     return e;
   };
@@ -278,11 +306,11 @@ export function refineRelRot(Rrel0, m0, f, { iters = 20 } = {}) {
     const resid = (Rr) => {
       const out = new Float64Array(m.length * 2);
       for (let k = 0; k < m.length; k++) {
-        const [xi, yi, xj, yj] = m[k];
-        const d = matVec3(Rr, [xi / f, yi / f, -1]);
+        const d = matVec3(Rr, ray(m[k]));
         const z = Math.min(d[2], -0.05);
-        out[k * 2] = -f * d[0] / z - xj;
-        out[k * 2 + 1] = -f * d[1] / z - yj;
+        const p = distortPt(-d[0] / z, -d[1] / z, k1);
+        out[k * 2] = f * p[0] - m[k][2];
+        out[k * 2 + 1] = f * p[1] - m[k][3];
       }
       return out;
     };

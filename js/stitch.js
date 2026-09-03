@@ -32,7 +32,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   const w = shots[0].w, h = shots[0].h;
   const cx = w / 2, cy = h / 2;
   const focal0 = (w / 2) / Math.tan(hfov / 2);
-  const bail = () => ({ rotations: gyroR, focalScale: 1, gains: shots.map(() => 1), connected: shots.map(() => true), ok: false, log });
+  const bail = () => ({ rotations: gyroR, focalScale: 1, k1: 0, gains: shots.map(() => 1), connected: shots.map(() => true), ok: false, log });
 
   if (N < 2) { log.push('need >= 2 frames'); return bail(); }
 
@@ -115,25 +115,63 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   // 4. focal length: median of the per-homography estimates
   let focal = focals.length >= 3 ? median(focals) : focal0;
   focal = clamp(focal, 0.5 * focal0, 2.0 * focal0);
-  const focalScale = focal / focal0;
-  log.push(`focal ${focal.toFixed(1)}px (init ${focal0.toFixed(1)}, ${focals.length} votes, scale ${focalScale.toFixed(3)})`);
+  log.push(`focal ${focal.toFixed(1)}px (init ${focal0.toFixed(1)}, ${focals.length} votes)`);
 
-  // 5. refine each pair's relative rotation, seeded from the gyro
+  // 4b. calibrate the lens: solve radial distortion k1 (and polish the focal)
+  // by minimising total pairwise reprojection error. A phone lens is not a
+  // pinhole, and the residual grows toward the frame edges - exactly where
+  // seams land - so leaving k1 at 0 misaligns every seam and loses pairs.
   onProgress('optimizing', 0);
+  const seedFor = (v, fl) => {
+    const gyroSeed = matMul3(matT3(gyroR[v.j]), gyroR[v.i]); // cam_i ray -> cam_j ray
+    try {
+      const hSeed = relRotFromHomography(v.H, fl);
+      const off = Math.hypot(...logSO3(matMul3(hSeed, matT3(gyroSeed))));
+      if (hSeed.every((x) => isFinite(x)) && off < 0.6) return hSeed;
+    } catch { /* keep gyro seed */ }
+    return gyroSeed;
+  };
+  const calibSet = verified.slice().sort((a, b) => b.inl - a.inl).slice(0, 12);
+  const scoreCalib = (fl, kk) => {
+    let sse = 0, n = 0;
+    for (const v of calibSet) {
+      const r = refineRelRot(seedFor(v, fl), v.mc, fl, { k1: kk, iters: 8 });
+      if (r.inl >= 10 && r.rms < 20) { sse += r.rms * r.rms * r.inl; n += r.inl; }
+    }
+    return n ? Math.sqrt(sse / n) : 1e9;
+  };
+  let k1 = 0;
+  if (calibSet.length >= 3) {
+    let best = scoreCalib(focal, 0);
+    for (let round = 0; round < 2; round++) {
+      const kStep = round === 0 ? 0.06 : 0.02;
+      for (let i = -4; i <= 4; i++) {
+        const kk = k1 + i * kStep;
+        if (kk < -0.45 || kk > 0.2 || i === 0) continue;
+        const sc = scoreCalib(focal, kk);
+        if (sc < best) { best = sc; k1 = kk; }
+      }
+      const fStep = round === 0 ? 0.04 : 0.015;
+      for (let i = -3; i <= 3; i++) {
+        if (i === 0) continue;
+        const fl = focal * (1 + i * fStep);
+        if (fl < 0.5 * focal0 || fl > 2 * focal0) continue;
+        const sc = scoreCalib(fl, k1);
+        if (sc < best) { best = sc; focal = fl; }
+      }
+      await tick();
+    }
+    log.push(`lens: k1 ${k1.toFixed(3)}, focal ${focal.toFixed(1)} ` +
+      `(${(focal / focal0).toFixed(3)}x), pair rms ${best.toFixed(2)}px`);
+  }
+
+  // 5. refine each pair's relative rotation with the calibrated lens
   const edges = [];
   const UF = new UnionFind(N);
   for (let e = 0; e < verified.length; e++) {
-    onProgress('optimizing', e / verified.length * 0.6);
+    onProgress('optimizing', 0.2 + e / verified.length * 0.5);
     const v = verified[e];
-    const gyroSeed = matMul3(matT3(gyroR[v.j]), gyroR[v.i]); // cam_i ray -> cam_j ray
-    // seed from the homography (already fits the matches); sanity-check vs gyro
-    let seed = gyroSeed;
-    try {
-      const hSeed = relRotFromHomography(v.H, focal);
-      const off = Math.hypot(...logSO3(matMul3(hSeed, matT3(gyroSeed))));
-      if (hSeed.every((x) => isFinite(x)) && off < 0.6) seed = hSeed;
-    } catch { /* keep gyro seed */ }
-    const { Rrel, rms, inl } = refineRelRot(seed, v.mc, focal);
+    const { Rrel, rms, inl } = refineRelRot(seedFor(v, focal), v.mc, focal, { k1 });
     // accept a pair if it aligns tightly, OR loosely but with lots of inliers
     // (wide-baseline / mild parallax pairs still anchor the graph)
     if (inl >= 10 && (rms < 4 || (rms < 6.5 && inl >= 25))) {
@@ -182,7 +220,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     sub.forEach((orig, k) => { gains[orig] = clamp(gg[k], 0.6, 1.6); });
   }
 
-  return { rotations, focalScale, gains, connected, ok: true, log };
+  return { rotations, focalScale: focal / focal0, k1, gains, connected, ok: true, log };
 }
 
 class UnionFind {

@@ -96,10 +96,9 @@ export function countCorners(gray, w, h, fastThresh = 14) {
   return n; // sampled on a 3px grid, so a fraction of the true corner count
 }
 
-export function detectAndDescribe(gray, w, h, {
-  fastThresh = 20, maxFeatures = 700, nmsRadius = 7, blurPasses = 1, minKeypoints = 90, _depth = 0,
-} = {}) {
-  const g = blur(gray, w, h, blurPasses);
+// One pyramid level: FAST-9 + non-max suppression + oriented BRIEF, all in
+// that level's own pixel coordinates.
+function detectLevel(g, w, h, fastThresh, maxFeatures, nmsRadius) {
   const border = PATCH + 4;
   const cand = [];
 
@@ -164,14 +163,6 @@ export function detectAndDescribe(gray, w, h, {
     kps.push(k);
   }
 
-  // adaptive: low-contrast frame -> retry with a gentler corner threshold
-  if (kps.length < minKeypoints && fastThresh > 6 && _depth < 2) {
-    return detectAndDescribe(gray, w, h, {
-      fastThresh: Math.max(6, Math.round(fastThresh * 0.55)),
-      maxFeatures, nmsRadius, blurPasses, minKeypoints, _depth: _depth + 1,
-    });
-  }
-
   // orientation (intensity centroid) + descriptor
   const desc = new Uint8Array(kps.length * 32);
   const r2 = PATCH * PATCH;
@@ -200,6 +191,53 @@ export function detectAndDescribe(gray, w, h, {
     }
   }
   return { kps, desc };
+}
+
+// Multi-scale ORB. A motion-blurred or soft frame loses fine corners but keeps
+// coarse structure, so detecting at 1/2 and 1/4 scale recovers features the
+// full-resolution pass simply cannot see - which is the difference between a
+// frame the stitcher can use and one it has to throw away. Keypoints are
+// reported in level-0 pixels; descriptors are built at their own octave.
+const OCTAVE_SHARE = [0.55, 0.3, 0.15];
+
+export function detectAndDescribe(gray, w, h, {
+  fastThresh = 20, maxFeatures = 700, nmsRadius = 7, blurPasses = 1,
+  minKeypoints = 90, octaves = 3,
+} = {}) {
+  const allK = [];
+  const allD = [];
+  let g = blur(gray, w, h, blurPasses), lw = w, lh = h, scale = 1;
+
+  for (let o = 0; o < octaves; o++) {
+    if (lw < 2 * (PATCH + 6) || lh < 2 * (PATCH + 6)) break;
+    const budget = Math.max(40, Math.round(maxFeatures * (OCTAVE_SHARE[o] || 0.1)));
+    let lvl = detectLevel(g, lw, lh, fastThresh, budget, nmsRadius);
+    // low-contrast level -> retry with a gentler corner threshold
+    let t = fastThresh;
+    for (let r = 0; r < 2 && lvl.kps.length < minKeypoints * (OCTAVE_SHARE[o] || 0.1) && t > 6; r++) {
+      t = Math.max(6, Math.round(t * 0.55));
+      lvl = detectLevel(g, lw, lh, t, budget, nmsRadius);
+    }
+    for (const k of lvl.kps) { k.x *= scale; k.y *= scale; k.octave = o; }
+    allK.push(...lvl.kps);
+    allD.push(lvl.desc);
+
+    const nw = lw >> 1, nh = lh >> 1;
+    if (nw < 8 || nh < 8) break;
+    const down = new Float32Array(nw * nh);
+    for (let y = 0; y < nh; y++) {
+      for (let x = 0; x < nw; x++) {
+        const i = (y * 2) * lw + x * 2;
+        down[y * nw + x] = (g[i] + g[i + 1] + g[i + lw] + g[i + lw + 1]) * 0.25;
+      }
+    }
+    g = down; lw = nw; lh = nh; scale *= 2;
+  }
+
+  const desc = new Uint8Array(allK.length * 32);
+  let off = 0;
+  for (const d of allD) { desc.set(d, off); off += d.length; }
+  return { kps: allK, desc };
 }
 
 function hamming(d, a, e, b) {
