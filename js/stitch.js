@@ -11,7 +11,7 @@
 // Output { rotations:[mat3 row-major per shot], focalScale, gains:[per shot],
 //          connected:[bool], ok, log }
 
-import { detectAndDescribe, matchDescriptors } from './orb.js';
+import { featureBackend } from './cv-features.js';
 import {
   ransacHomography, focalFromHomography, relRotFromHomography, refineRelRot,
   rotationAverage, bundleAdjust, gainCompensate, qToR, matMul3, matT3, logSO3,
@@ -37,11 +37,13 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   if (N < 2) { log.push('need >= 2 frames'); return bail(); }
 
   // 1. features
+  onProgress('loading vision', 0);
+  const vision = await featureBackend();
+  log.push(`vision: ${vision.kind}`);
   const feats = [];
   for (let i = 0; i < N; i++) {
     onProgress('features', i / N);
-    feats.push(detectAndDescribe(shots[i].gray, shots[i].w, shots[i].h,
-      { fastThresh: 18, maxFeatures: 900, minKeypoints: 120 }));
+    feats.push(vision.detect(shots[i].gray, shots[i].w, shots[i].h));
     await tick();
   }
   const counts = feats.map((f) => f.kps.length);
@@ -83,7 +85,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   for (let c = 0; c < cand.length; c++) {
     onProgress('matching', c / cand.length);
     const [i, j] = cand[c];
-    const raw = matchDescriptors(feats[i].desc, feats[j].desc, 0.82);
+    const raw = vision.match(feats[i], feats[j]);
     bestRaw = Math.max(bestRaw, raw.length);
     if (raw.length >= 10) {
       const pa = raw.map(([a]) => [feats[i].kps[a].x, feats[i].kps[a].y]);
