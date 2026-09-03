@@ -10,3 +10,5 @@ dist/
 *.log
 .vercel
 .netlify
+
+selftest.mjs
