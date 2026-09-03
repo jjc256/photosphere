@@ -119,37 +119,17 @@ bool warp(out vec3 rgb, out float edge) {
   return true;
 }`;
 
-// Seam labelling: nearest-centre (Voronoi) wins via the depth buffer.
-// Output R = (frameIndex+1)/255, G = border distance.
-const LABEL_FRAG = WARP_HEAD + `
+// Plain warp of one frame -> rgb, a = coverage.
+const WARPC_FRAG = WARP_HEAD + `
 out vec4 frag;
-uniform float uIndex;
-uniform float uPriority;               // 1 for aligned frames, low for gyro-only
 void main() {
   vec3 rgb; float edge;
   if (!warp(rgb, edge)) discard;
-  gl_FragDepth = 1.0 - edge * uPriority * 0.999; // higher (border dist * priority) wins
-  frag = vec4((uIndex + 1.0) / 255.0, edge, 0.0, 1.0);
-}`;
-
-// HARD mosaic: this frame's warped colour, but only on the pixels it owns
-// (label winner). No blending -> single source everywhere -> no ghosting.
-const HARD_FRAG = WARP_HEAD + `
-out vec4 frag;
-uniform sampler2D uLabel;
-uniform float uIndex;
-void main() {
-  vec3 rgb; float edge;
-  if (!warp(rgb, edge)) discard;
-  float lab = texture(uLabel, vUv).r * 255.0;
-  if (abs(lab - (uIndex + 1.0)) > 0.5) discard;
   frag = vec4(rgb, 1.0);
 }`;
 
-// Feather-weighted accumulate (for the LOW-frequency blend only). This does
-// average overlapping frames, but the result is heavily blurred afterwards so
-// a 1-3 px misalignment becomes invisible; it just carries smooth colour /
-// exposure across seams.
+// Feather-weighted accumulate -> a consensus mosaic, used as the reference
+// the seam finder measures each frame against.
 const FA_FRAG = WARP_HEAD + `
 out vec4 frag;
 void main() {
@@ -157,6 +137,76 @@ void main() {
   if (!warp(rgb, edge)) discard;
   float w = edge * edge + 0.02;
   frag = vec4(rgb * w, w);
+}`;
+
+// Photometric disagreement between this frame and the consensus. Blurred
+// afterwards, this is the seam-finding cost: the Kwatra graph-cut objective
+// routes cuts through pixels where the sources agree, and minimising a
+// smoothed version of the same |A - B| term is a cheap stand-in for it.
+const DIFF_FRAG = WARP_HEAD + `
+out vec4 frag;
+uniform sampler2D uAvg;
+void main() {
+  vec3 rgb; float edge;
+  if (!warp(rgb, edge)) { frag = vec4(1.0); return; }  // no data = maximum cost
+  vec4 a = texture(uAvg, vUv);
+  float d = a.a > 0.5 ? clamp(length(rgb - a.rgb) * 1.4, 0.0, 1.0) : 0.0;
+  frag = vec4(vec3(d), 1.0);
+}`;
+
+// Seam labelling. Priority = border distance - lambda * (blurred disagreement
+// with the consensus), so seams bend away from parallax / moving objects and
+// through regions where the frames match. Winner via the depth buffer.
+const LABEL_FRAG = WARP_HEAD + `
+out vec4 frag;
+uniform float uIndex;
+uniform float uPriority;               // 1 for aligned frames, low for gyro-only
+uniform float uLambda;
+uniform sampler2D uCost;
+void main() {
+  vec3 rgb; float edge;
+  if (!warp(rgb, edge)) discard;
+  float cost = texture(uCost, vUv).r;
+  float pri = clamp(edge - uLambda * cost, 0.0, 1.0) * uPriority;
+  gl_FragDepth = 1.0 - pri * 0.999;    // higher priority -> smaller depth -> wins
+  frag = vec4((uIndex + 1.0) / 255.0, edge, 0.0, 1.0);
+}`;
+
+// Binary ownership mask for one frame (1 where it won the seam label).
+const MASK_FRAG = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 frag;
+uniform sampler2D uLabel;
+uniform float uWant;
+void main() {
+  float lab = texture(uLabel, vUv).r * 255.0;
+  frag = vec4(abs(lab - uWant) < 0.5 ? 1.0 : 0.0);
+}`;
+
+// Burt-Adelson band accumulation. Each source's own band is weighted by that
+// source's mask blurred to THAT band's width: narrow for detail (so detail
+// stays single-source and can't ghost), wide for the base (so exposure and
+// colour ramp across the seam and the cut disappears).
+const ACC_FRAG = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 frag;
+uniform sampler2D uW;      // warped frame (a = coverage)
+uniform sampler2D uWLo;    // blurred warped frame
+uniform sampler2D uMask;   // this frame's mask, blurred to the band width
+uniform float uHigh;       // 1 = detail band (W - WLo), 0 = base band (WLo)
+void main() {
+  float m = texture(uMask, vUv).r;
+  if (m <= 0.002) discard;
+  vec4 w = texture(uW, vUv);
+  if (w.a < 0.5) discard;              // only where this frame really covers
+  // uWLo is a blur of (rgb, coverage), so divide out the coverage weight -
+  // otherwise the blur drags in black from beyond the frame border.
+  vec4 l = texture(uWLo, vUv);
+  vec3 lo = l.a > 1e-3 ? l.rgb / l.a : w.rgb;
+  vec3 band = uHigh > 0.5 ? (w.rgb - lo) : lo;
+  frag = vec4(band * m, m);
 }`;
 
 // Separable blur (13-tap gaussian, scaled by uStep).
@@ -177,26 +227,20 @@ void main() {
   frag = acc / wsum;
 }`;
 
-// 2-band combine: high-frequency detail from the HARD (single-source) mosaic
-// + low-frequency colour from the feather-blended, heavily-blurred mosaic.
-//   result = hard - blur(hard) + blur(featherBlend)
-// Away from seams this is exactly the source frame; across a seam the detail
-// stays single-source (an occasional visible cut, never a double image) while
-// colour/exposure blends smoothly.
+// Collapse the blended bands: detail/W + base/W. Away from every seam each
+// band comes wholly from one frame and the sum is exactly that frame.
 const COMBINE2_FRAG = `#version 300 es
 precision highp float;
 in vec2 vUv;
 out vec4 frag;
-uniform sampler2D uHard;
-uniform sampler2D uHardLo;
-uniform sampler2D uLo;
-uniform float uFlipY;
+uniform sampler2D uHi;     // detail band accumulator (rgb*m, m)
+uniform sampler2D uLo;     // base band accumulator   (rgb*m, m)
 void main() {
-  vec2 uv = vec2(vUv.x, uFlipY > 0.5 ? 1.0 - vUv.y : vUv.y);
-  vec4 hard = texture(uHard, uv);
-  vec3 detail = hard.rgb - texture(uHardLo, uv).rgb;
-  vec3 lo = texture(uLo, uv).rgb;
-  frag = vec4(clamp(detail + lo, 0.0, 1.0), hard.a);
+  vec4 hi = texture(uHi, vUv);
+  vec4 lo = texture(uLo, vUv);
+  if (lo.a <= 1e-4) { frag = vec4(0.0); return; }
+  vec3 c = lo.rgb / lo.a + (hi.a > 1e-4 ? hi.rgb / hi.a : vec3(0.0));
+  frag = vec4(clamp(c, 0.0, 1.0), 1.0);
 }`;
 
 // Normalise the accum buffer; alpha carries coverage (1 = real imagery).
@@ -300,7 +344,10 @@ export class PanoEngine {
     this.pSphere = program(gl, SPHERE_FRAG);
     this.pCoverage = program(gl, COVERAGE_FRAG);
     this.pLabel = program(gl, LABEL_FRAG);
-    this.pHard = program(gl, HARD_FRAG);
+    this.pWarpC = program(gl, WARPC_FRAG);
+    this.pDiff = program(gl, DIFF_FRAG);
+    this.pMask = program(gl, MASK_FRAG);
+    this.pAcc = program(gl, ACC_FRAG);
     this.pFA = program(gl, FA_FRAG);
     this.pBlur = program(gl, BLUR_FRAG);
     this.pNorm2 = program(gl, NORMALIZE2_FRAG);
@@ -545,11 +592,10 @@ export class PanoEngine {
     return cvs;
   }
 
-  // ---- 2-band seam compositor -----------------------------------------
-  // Nearest-centre (Voronoi) seam labels -> a HARD single-source mosaic for
-  // high-frequency detail (an occasional visible cut, never a double image)
-  // + a heavily blurred feather-blend for low-frequency colour/exposure
-  // (a few-px misalignment is invisible once blurred). Then fill the caps.
+  // ---- multi-band seam compositor --------------------------------------
+  // Standard stitcher compositing chain (OpenCV Stitcher / enblend):
+  //   consensus mosaic -> content-aware seam labels -> Burt-Adelson
+  //   multi-band blend -> pole fill.
   // Intermediates run at 2048 wide to keep iOS GPU memory sane; the result
   // is upscaled into panoTex.
   _initComposite() {
@@ -559,9 +605,10 @@ export class PanoEngine {
     this.cs = cs; this.csh = cs / 2;
     const hf = this._floatLinear ? gl.LINEAR : gl.NEAREST;
     const t8 = () => this._tex(cs, this.csh, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.REPEAT);
+    const t16 = () => this._tex(cs, this.csh, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, hf, gl.REPEAT);
     this.frameTex = this._tex(4, 4, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.CLAMP_TO_EDGE);
-    this.faTex = this._tex(cs, this.csh, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, hf, gl.REPEAT);
-    this.faFbo = this._fbo(this.faTex);
+    this.accHi = t16(); this.accHiFbo = this._fbo(this.accHi);
+    this.accLo = t16(); this.accLoFbo = this._fbo(this.accLo);
     this.labelTex = this._tex(cs, this.csh, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST, gl.REPEAT);
     this.labelFbo = gl.createFramebuffer();
     this.labelDepth = gl.createRenderbuffer();
@@ -571,10 +618,12 @@ export class PanoEngine {
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.labelTex, 0);
     gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, this.labelDepth);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    this.hardTex = t8(); this.hardFbo = this._fbo(this.hardTex);
-    this.s0 = t8(); this.s0f = this._fbo(this.s0);
-    this.s1 = t8(); this.s1f = this._fbo(this.s1);
-    this.s2 = t8(); this.s2f = this._fbo(this.s2);
+    this.avgTex = t8(); this.avgFbo = this._fbo(this.avgTex);
+    this.wTex = t8(); this.wFbo = this._fbo(this.wTex);        // warped frame
+    this.wLoTex = t8(); this.wLoFbo = this._fbo(this.wLoTex);  // blurred frame
+    this.mTex = t8(); this.mFbo = this._fbo(this.mTex);        // mask / scratch
+    this.mHi = t8(); this.mHiFbo = this._fbo(this.mHi);        // mask, narrow blur
+    this.pingTex = t8(); this.pingFbo = this._fbo(this.pingTex);
     this._compReady = true;
   }
 
@@ -613,6 +662,8 @@ export class PanoEngine {
     this._quad();
   }
 
+  _vp() { this.gl.viewport(0, 0, this.cs, this.csh); }
+
   // frames: [{ img, R (row-major camera->world), gain, weak }]. tanX/tanY =
   // tan(fov/2) for the focal-corrected lens. Fills panoTex.
   compositeStitched(frames, tanX, tanY) {
@@ -620,93 +671,148 @@ export class PanoEngine {
     this._initComposite();
     const w = this.cs, h = this.csh;
     const rots = frames.map((f) => matT3col(f.R));
+    const warpTo = (prog, fbo, k) => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      this._vp();
+      this._warpUniforms(prog, rots[k], tanX, tanY, frames[k].gain || 1);
+    };
 
-    // pass 1: seam labels (nearest centre wins via depth)
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.labelFbo);
-    gl.viewport(0, 0, w, h);
-    gl.disable(gl.BLEND);
-    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.depthMask(true);
-    gl.clearColor(0, 0, 0, 0); gl.clearDepth(1.0);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    gl.useProgram(this.pLabel);
-    frames.forEach((fr, k) => {
-      this._uploadFrame(fr.img);
-      this._warpUniforms(this.pLabel, rots[k], tanX, tanY, fr.gain || 1);
-      gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uIndex'), k);
-      gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uPriority'), fr.weak ? 0.18 : 1.0);
-      this._quad();
-    });
-    gl.disable(gl.DEPTH_TEST);
-
-    // pass 2a: HARD mosaic (single source per pixel) -> hardTex
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.hardFbo);
-    gl.viewport(0, 0, w, h); gl.disable(gl.BLEND);
-    gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.useProgram(this.pHard);
-    frames.forEach((fr, k) => {
-      this._uploadFrame(fr.img);
-      this._warpUniforms(this.pHard, rots[k], tanX, tanY, fr.gain || 1);
-      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.labelTex);
-      gl.uniform1i(gl.getUniformLocation(this.pHard, 'uLabel'), 1);
-      gl.uniform1f(gl.getUniformLocation(this.pHard, 'uIndex'), k);
-      this._quad();
-    });
-
-    // pass 2b: feather-weighted accumulate -> faTex
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.faFbo);
-    gl.viewport(0, 0, w, h);
-    gl.disable(gl.BLEND);
+    // ---- 1. consensus mosaic (feather average) -> avgTex ----------------
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.accLoFbo);
+    this._vp(); gl.disable(gl.BLEND);
     gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
     gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD); gl.blendFunc(gl.ONE, gl.ONE);
     gl.useProgram(this.pFA);
     frames.forEach((fr, k) => {
       this._uploadFrame(fr.img);
-      this._warpUniforms(this.pFA, rots[k], tanX, tanY, fr.gain || 1);
+      warpTo(this.pFA, this.accLoFbo, k);
       this._quad();
     });
     gl.disable(gl.BLEND);
-
-    // normalise feather-blend -> s0
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.s0f);
-    gl.viewport(0, 0, w, h); gl.disable(gl.BLEND);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.avgFbo);
+    this._vp();
     gl.useProgram(this.pNorm2);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.faTex);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.accLo);
     gl.uniform1i(gl.getUniformLocation(this.pNorm2, 'uAccum'), 0);
     this._quad();
 
-    // band split: hardLo = blur(hard) -> s2 ;  lo = blur(featherBlend) -> s0
-    const spread = Math.max(10, w / 42);
-    this._blur(this.hardTex, this.s2f, this.s1, this.s1f, spread); // -> s2
-    this._blur(this.s0, this.s0f, this.s1, this.s1f, spread);      // s0 -> s0
+    // ---- 2. content-aware seam labels -----------------------------------
+    // For each frame: how much it disagrees with the consensus, blurred (the
+    // smoothing is what makes the resulting boundary a smooth seam rather
+    // than per-pixel noise), then a depth-tested "who wins" draw where
+    // priority = borderDistance - lambda * disagreement.
+    const costBlur = Math.max(6, w / 128);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.labelFbo);
+    this._vp(); gl.disable(gl.BLEND);
+    gl.clearColor(0, 0, 0, 0); gl.clearDepth(1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-    // combine  detail(hard) + lo  -> s1
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.s1f);
-    gl.viewport(0, 0, w, h); gl.disable(gl.BLEND);
+    frames.forEach((fr, k) => {
+      this._uploadFrame(fr.img);
+      // disagreement -> mTex
+      gl.useProgram(this.pDiff);
+      warpTo(this.pDiff, this.mFbo, k);
+      gl.disable(gl.BLEND);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.avgTex);
+      gl.uniform1i(gl.getUniformLocation(this.pDiff, 'uAvg'), 1);
+      this._quad();
+      this._blur(this.mTex, this.mHiFbo, this.pingTex, this.pingFbo, costBlur);
+
+      // depth-tested label draw
+      gl.useProgram(this.pLabel);
+      warpTo(this.pLabel, this.labelFbo, k);
+      gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.depthMask(true);
+      gl.disable(gl.BLEND);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.mHi);
+      gl.uniform1i(gl.getUniformLocation(this.pLabel, 'uCost'), 1);
+      gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uLambda'), 0.6);
+      gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uIndex'), k);
+      gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uPriority'), fr.weak ? 0.18 : 1.0);
+      this._quad();
+      gl.disable(gl.DEPTH_TEST);
+    });
+
+    // ---- 3. Burt-Adelson multi-band blend --------------------------------
+    // Each source's detail band is weighted by its mask blurred narrowly (so
+    // detail stays single-source: a cut, never a ghost); each source's base
+    // band by the same mask blurred widely (so exposure/colour ramps across
+    // the seam and the cut stops being visible).
+    const bandSplit = Math.max(8, w / 64);   // detail/base cutoff
+    const maskNarrow = Math.max(2, w / 512);
+    const maskWide = Math.max(24, w / 20);
+
+    [this.accHiFbo, this.accLoFbo].forEach((f) => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+      this._vp(); gl.disable(gl.BLEND);
+      gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    });
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    const accBand = (accFbo, maskTex, high) => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, accFbo);
+      this._vp();
+      gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD); gl.blendFunc(gl.ONE, gl.ONE);
+      gl.useProgram(this.pAcc);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.wTex);
+      gl.uniform1i(gl.getUniformLocation(this.pAcc, 'uW'), 0);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.wLoTex);
+      gl.uniform1i(gl.getUniformLocation(this.pAcc, 'uWLo'), 1);
+      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, maskTex);
+      gl.uniform1i(gl.getUniformLocation(this.pAcc, 'uMask'), 2);
+      gl.uniform1f(gl.getUniformLocation(this.pAcc, 'uHigh'), high);
+      this._quad();
+      gl.disable(gl.BLEND);
+    };
+
+    frames.forEach((fr, k) => {
+      this._uploadFrame(fr.img);
+      // warp -> wTex, band split -> wLoTex
+      gl.useProgram(this.pWarpC);
+      warpTo(this.pWarpC, this.wFbo, k);
+      gl.disable(gl.BLEND);
+      gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+      this._quad();
+      this._blur(this.wTex, this.wLoFbo, this.pingTex, this.pingFbo, bandSplit);
+
+      // ownership mask -> mTex, narrow blur -> mHi
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.mFbo);
+      this._vp(); gl.disable(gl.BLEND);
+      gl.useProgram(this.pMask);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.labelTex);
+      gl.uniform1i(gl.getUniformLocation(this.pMask, 'uLabel'), 0);
+      gl.uniform1f(gl.getUniformLocation(this.pMask, 'uWant'), k + 1);
+      this._quad();
+      this._blur(this.mTex, this.mHiFbo, this.pingTex, this.pingFbo, maskNarrow);
+      accBand(this.accHiFbo, this.mHi, 1);
+
+      // same mask, wide blur -> base band
+      this._blur(this.mHi, this.mFbo, this.pingTex, this.pingFbo, maskWide);
+      accBand(this.accLoFbo, this.mTex, 0);
+    });
+
+    // ---- 4. collapse bands -> avgTex (reused), fill caps, upscale --------
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.avgFbo);
+    this._vp(); gl.disable(gl.BLEND);
     gl.useProgram(this.pCombine2);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.hardTex);
-    gl.uniform1i(gl.getUniformLocation(this.pCombine2, 'uHard'), 0);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.s2);
-    gl.uniform1i(gl.getUniformLocation(this.pCombine2, 'uHardLo'), 1);
-    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.s0);
-    gl.uniform1i(gl.getUniformLocation(this.pCombine2, 'uLo'), 2);
-    gl.uniform1f(gl.getUniformLocation(this.pCombine2, 'uFlipY'), 0);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.accHi);
+    gl.uniform1i(gl.getUniformLocation(this.pCombine2, 'uHi'), 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.accLo);
+    gl.uniform1i(gl.getUniformLocation(this.pCombine2, 'uLo'), 1);
     this._quad();
 
-    // fill uncovered caps: s1 -> s0 -> s1
     gl.useProgram(this.pPole);
     gl.uniform2f(gl.getUniformLocation(this.pPole, 'uTexel'), 1 / w, 1 / h);
     gl.uniform1i(gl.getUniformLocation(this.pPole, 'uSrc'), 0);
-    let src = this.s1;
+    let src = this.avgTex;
     for (let i = 0; i < 3; i++) {
-      const dstFbo = src === this.s1 ? this.s0f : this.s1f;
-      gl.bindFramebuffer(gl.FRAMEBUFFER, dstFbo);
-      gl.viewport(0, 0, w, h); gl.disable(gl.BLEND);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, src === this.avgTex ? this.mFbo : this.avgFbo);
+      this._vp(); gl.disable(gl.BLEND);
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src);
       this._quad();
-      src = src === this.s1 ? this.s0 : this.s1;
+      src = src === this.avgTex ? this.mTex : this.avgTex;
     }
 
-    // upscale the finished 2048 pano into panoTex (this.size)
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.panoFbo);
     gl.viewport(0, 0, this.size, this.h); gl.disable(gl.BLEND);
     gl.useProgram(this.pBlit);
