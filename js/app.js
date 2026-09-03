@@ -1,4 +1,5 @@
 import { PanoEngine } from './pano.js';
+import { stitch } from './stitch.js';
 import { buildGPanoXMP, embedMetadata } from './xmp.js';
 import { buildExifSegment } from './exif.js';
 import {
@@ -12,6 +13,11 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 // ---- panorama coverage grid ----------------------------------------------
 const NCOL = 24, NROW = 8;
 const LAT_MAX = 62, LAT_MIN = -62; // degrees; poles are hard to shoot hand-held
+
+// ---- captured-frame budget --------------------------------------------------
+const MAX_SHOTS = 32;   // memory-bounded; ImageData is kept for the final blend
+const CAP_LONG = 1024;  // long side kept for compositing
+const GRAY_LONG = 400;  // long side used for feature detection
 
 const state = {
   stream: null,
@@ -28,6 +34,7 @@ const state = {
   vidRot: 0,
   autoCap: true,
   covered: new Set(),
+  shots: [],          // { imgData, w, h, gray, gw, gh, quat, hfovDeg }
   cells: [],
   raf: 0,
   running: false,
@@ -174,6 +181,7 @@ function cellWorld(c, r) {
 
 function resetCoverage() {
   state.covered.clear();
+  state.shots = [];
   state.lastCapQuat = null;
   $('coverage').textContent = '0%';
   for (const d of state.cells) d.classList.remove('covered', 'current');
@@ -211,11 +219,48 @@ function refreshGridClasses() {
 }
 
 // ---- capture --------------------------------------------------------------
+function stashShot() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw) return;
+  const draw = (long) => {
+    const s = Math.min(1, long / Math.max(vw, vh));
+    const w = Math.max(8, Math.round(vw * s)), h = Math.max(8, Math.round(vh * s));
+    const c = (draw._c = draw._c || document.createElement('canvas'));
+    c.width = w; c.height = h;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(video, 0, 0, w, h);
+    return { w, h, data: ctx.getImageData(0, 0, w, h) };
+  };
+  const big = draw(CAP_LONG);
+  const sm = draw(GRAY_LONG);
+  const gray = new Uint8ClampedArray(sm.w * sm.h);
+  const d = sm.data.data;
+  for (let i = 0, p = 0; i < gray.length; i++, p += 4) {
+    gray[i] = (d[p] * 77 + d[p + 1] * 150 + d[p + 2] * 29) >> 8;
+  }
+  state.shots.push({
+    imgData: big.data, w: big.w, h: big.h,
+    gray, gw: sm.w, gh: sm.h,
+    quat: state.quat.slice(), hfovDeg: state.hfovDeg,
+  });
+  if (state.shots.length > MAX_SHOTS) {
+    let bi = 0, bd = Infinity;
+    for (let i = 0; i < state.shots.length; i++) {
+      for (let j = i + 1; j < state.shots.length; j++) {
+        const a = quatAngle(state.shots[i].quat, state.shots[j].quat);
+        if (a < bd) { bd = a; bi = i; }
+      }
+    }
+    state.shots.splice(bi, 1);
+  }
+}
+
 function doCapture(manual) {
   if (!video.videoWidth) return;
   updateOrientation(); // capture against the freshest pose
   const { tanX, tanY } = fovTangents();
-  state.engine.splat(video, state.R, tanX, tanY, state.vidRot);
+  state.engine.splat(video, state.R, tanX, tanY, state.vidRot); // live guide preview
+  stashShot();                                                  // for the real stitch on Done
   state.lastCapQuat = state.quat;
   markCovered(state.R, tanX, tanY);
   const s = $('btn-shutter');
@@ -319,19 +364,58 @@ async function start() {
 }
 
 // ---- review --------------------------------------------------------------
-function toReview() {
+async function toReview() {
   cancelAnimationFrame(state.raf);
   state.running = false;
-  if (state.covered.size === 0) { toast('Capture at least one frame first.'); return resume(); }
-  state.engine.bake();
+  if (state.shots.length < 2) { toast('Capture at least 2 overlapping frames.'); return resume(); }
+
+  const st = $('export-status');
+  st.hidden = false;
+  st.textContent = 'Stitching…';
+  await new Promise((r) => setTimeout(r, 20));
+
+  let result;
+  try {
+    result = await stitch(
+      state.shots.map((s) => ({ gray: s.gray, w: s.gw, h: s.gh, quat: s.quat, hfovDeg: s.hfovDeg })),
+      { onProgress: (stage, f) => { st.textContent = `Stitching · ${stage} ${Math.round(f * 100)}%`; } },
+    );
+  } catch (e) {
+    result = { ok: false, log: ['stitch error: ' + (e && e.message || e)] };
+  }
+  state._stitchLog = result.log || [];
+  console.log('[stitch]', ...(result.log || []));
+
+  try {
+    if (result.ok) {
+      st.textContent = 'Stitching · blending';
+      await new Promise((r) => setTimeout(r, 20));
+      const s0 = state.shots[0];
+      const tanX = Math.tan((state.hfovDeg * DEG) / 2) / result.focalScale;
+      const tanY = tanX * (s0.h / s0.w);
+      state.engine.compositeStitched(
+        state.shots.map((s, k) => ({ img: s.imgData, R: result.rotations[k], gain: result.gains[k] })),
+        tanX, tanY,
+      );
+      const nConn = result.connected.filter(Boolean).length;
+      if (nConn < state.shots.length) toast(`Aligned ${nConn} of ${state.shots.length} frames`);
+    } else {
+      state.engine.bake(); // gyro-only fallback (from the live splat accumulation)
+      toast('Feature match failed — using gyro alignment');
+    }
+  } catch (e) {
+    console.warn('composite failed', e);
+    state.engine.bake();
+    toast('Blend failed — using gyro alignment');
+  }
+  st.hidden = true;
 
   glCanvas.className = 'gl-full';
   $('viewer').appendChild(glCanvas);
   state.view.yaw = 0; state.view.pitch = 0; state.view.fov = 72 * DEG;
   state.viewFlat = false;
   $('btn-viewmode').textContent = 'Flat view';
-  $('review-cov').textContent =
-    Math.round((state.covered.size / (NCOL * NROW)) * 100) + '% covered';
+  $('review-cov').textContent = `${state.shots.length} frames`;
 
   if (navigator.canShare) $('btn-share').hidden = false;
 
@@ -341,6 +425,7 @@ function toReview() {
 }
 
 function resume() {
+  if (state.engine) state.engine._composited = false; // live preview = accum again
   glCanvas.className = 'gl-mini';
   $('screen-capture').appendChild(glCanvas);
   state.running = true;

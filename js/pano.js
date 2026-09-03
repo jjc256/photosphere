@@ -22,6 +22,7 @@ out vec4 frag;
 uniform mat3 uRot;        // camera -> world
 uniform vec2 uTan;        // tan(hfov/2), tan(vfov/2)
 uniform float uFeather;   // edge feather width, 0..0.5
+uniform float uGain;      // exposure gain
 uniform mat2 uVidRot;     // in-plane frame rotation
 uniform sampler2D uVideo;
 const float PI = 3.14159265359;
@@ -37,7 +38,7 @@ void main() {
   float m = max(abs(px), abs(py));
   if (m > 1.0) discard;                        // outside the frame
   vec2 uv = uVidRot * vec2(px, py) * 0.5 + 0.5;
-  vec3 c = texture(uVideo, uv).rgb;
+  vec3 c = clamp(texture(uVideo, uv).rgb * uGain, 0.0, 1.0);
   float w = 1.0 - smoothstep(1.0 - uFeather, 1.0, m);
   w = max(w, 2e-3);
   frag = vec4(c * w, w);
@@ -91,6 +92,95 @@ void main() {
   frag = vec4(vec3(a > 4e-3 ? 1.0 : 0.0), 1.0);
 }`;
 
+// ---- multi-band compositor (stitched path) --------------------------------
+// Shared warp: equirect texel -> world dir -> camera k -> frame uv, plus a
+// border-distance weight used both for feathering and seam selection.
+const WARP_HEAD = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform mat3 uRot;       // camera -> world (pass transpose of row-major c2w)
+uniform vec2 uTan;       // tan(hfov/2), tan(vfov/2)
+uniform float uGain;
+uniform sampler2D uFrame;
+const float PI = 3.14159265359;
+bool warp(out vec3 rgb, out float edge) {
+  float lon = (vUv.x - 0.5) * 2.0 * PI;
+  float lat = (vUv.y - 0.5) * PI;
+  float cl = cos(lat);
+  vec3 world = vec3(cl * sin(lon), sin(lat), -cl * cos(lon));
+  vec3 cam = transpose(uRot) * world;
+  if (cam.z > -1e-4) return false;
+  float px = (cam.x / -cam.z) / uTan.x;
+  float py = (cam.y / -cam.z) / uTan.y;
+  if (max(abs(px), abs(py)) > 1.0) return false;
+  vec2 uv = vec2(px, py) * 0.5 + 0.5;
+  rgb = clamp(texture(uFrame, uv).rgb * uGain, 0.0, 1.0);
+  edge = clamp(min(1.0 - abs(px), 1.0 - abs(py)) * 3.0, 0.0, 1.0);
+  return true;
+}`;
+
+const WARP_LO_FRAG = WARP_HEAD + `
+out vec4 frag;
+void main() {
+  vec3 rgb; float edge;
+  if (!warp(rgb, edge)) discard;
+  float w = smoothstep(0.0, 0.6, edge) + 1e-3;
+  frag = vec4(rgb * w, w);
+}`;
+
+const WARP_WIN_FRAG = WARP_HEAD + `
+out vec4 frag;
+void main() {
+  vec3 rgb; float edge;
+  if (!warp(rgb, edge)) discard;
+  gl_FragDepth = 1.0 - edge;            // higher edge distance wins (depth LESS)
+  frag = vec4(rgb, 1.0);
+}`;
+
+const BLUR_FRAG = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 frag;
+uniform sampler2D uSrc;
+uniform vec2 uStep;                     // texel * direction * spread
+void main() {
+  float wsum = 0.0;
+  vec3 acc = vec3(0.0);
+  for (int i = -6; i <= 6; i++) {
+    float w = exp(-float(i * i) / 18.0);
+    acc += texture(uSrc, vUv + uStep * float(i)).rgb * w;
+    wsum += w;
+  }
+  frag = vec4(acc / wsum, 1.0);
+}`;
+
+const COMBINE_FRAG = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 frag;
+uniform sampler2D uLo;      // feathered blend, normalised (low freq, exposure)
+uniform sampler2D uWin;     // seam-winner full colour
+uniform sampler2D uWinLo;   // blurred winner (low freq of the winner)
+uniform float uFlipY;
+void main() {
+  vec2 uv = vec2(vUv.x, uFlipY > 0.5 ? 1.0 - vUv.y : vUv.y);
+  vec3 lo = texture(uLo, uv).rgb;
+  vec3 win = texture(uWin, uv).rgb;
+  vec3 winLo = texture(uWinLo, uv).rgb;
+  vec3 c = lo + (win - winLo);          // 2-band Laplacian blend
+  frag = vec4(clamp(c, 0.0, 1.0), 1.0);
+}`;
+
+const BLIT_FRAG = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 frag;
+uniform sampler2D uSrc;
+uniform float uFlipY;
+void main() {
+  frag = texture(uSrc, vec2(vUv.x, uFlipY > 0.5 ? 1.0 - vUv.y : vUv.y));
+}`;
+
 function compile(gl, type, src) {
   const s = gl.createShader(type);
   gl.shaderSource(s, src);
@@ -138,6 +228,12 @@ export class PanoEngine {
     this.pPresent = program(gl, PRESENT_FRAG);
     this.pSphere = program(gl, SPHERE_FRAG);
     this.pCoverage = program(gl, COVERAGE_FRAG);
+    this.pWarpLo = program(gl, WARP_LO_FRAG);
+    this.pWarpWin = program(gl, WARP_WIN_FRAG);
+    this.pBlur = program(gl, BLUR_FRAG);
+    this.pCombine = program(gl, COMBINE_FRAG);
+    this.pBlit = program(gl, BLIT_FRAG);
+    this._composited = false;
 
     this.vao = gl.createVertexArray(); // empty; vertices come from gl_VertexID
 
@@ -187,6 +283,7 @@ export class PanoEngine {
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     this.frames = 0;
+    this._composited = false;
   }
 
   _quad() {
@@ -196,13 +293,14 @@ export class PanoEngine {
 
   // Project one camera frame onto the accumulation buffer.
   // R: camera->world mat3. tanX/tanY: tan(fov/2). vidRot: 0..3 quarter turns.
-  splat(video, R, tanX, tanY, vidRot = 0, feather = 0.16) {
+  // source: a <video> or any TexImageSource (ImageData/canvas/ImageBitmap).
+  splat(source, R, tanX, tanY, vidRot = 0, feather = 0.16, gain = 1) {
     const gl = this.gl;
-    if (!video.videoWidth) return;
+    if (source.videoWidth === 0) return;
 
     gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
 
     const a = (vidRot % 4) * Math.PI / 2;
@@ -218,6 +316,7 @@ export class PanoEngine {
     gl.uniformMatrix3fv(gl.getUniformLocation(this.pSplat, 'uRot'), false, R);
     gl.uniform2f(gl.getUniformLocation(this.pSplat, 'uTan'), tanX, tanY);
     gl.uniform1f(gl.getUniformLocation(this.pSplat, 'uFeather'), feather);
+    gl.uniform1f(gl.getUniformLocation(this.pSplat, 'uGain'), gain);
     gl.uniformMatrix2fv(gl.getUniformLocation(this.pSplat, 'uVidRot'), false, [c, s, -s, c]);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
@@ -254,11 +353,18 @@ export class PanoEngine {
     let w = cw, h = cw / 2;
     if (h > chh) { h = chh; w = chh * 2; }
     gl.viewport((cw - w) / 2, (chh - h) / 2, w, h);
-    gl.useProgram(this.pPresent);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.accumTex);
-    gl.uniform1i(gl.getUniformLocation(this.pPresent, 'uAccum'), 0);
-    gl.uniform1f(gl.getUniformLocation(this.pPresent, 'uFlipY'), 0);
+    if (this._composited) {
+      gl.useProgram(this.pBlit);
+      gl.bindTexture(gl.TEXTURE_2D, this.panoTex);
+      gl.uniform1i(gl.getUniformLocation(this.pBlit, 'uSrc'), 0);
+      gl.uniform1f(gl.getUniformLocation(this.pBlit, 'uFlipY'), 0);
+    } else {
+      gl.useProgram(this.pPresent);
+      gl.bindTexture(gl.TEXTURE_2D, this.accumTex);
+      gl.uniform1i(gl.getUniformLocation(this.pPresent, 'uAccum'), 0);
+      gl.uniform1f(gl.getUniformLocation(this.pPresent, 'uFlipY'), 0);
+    }
     this._quad();
   }
 
@@ -340,7 +446,18 @@ export class PanoEngine {
       this._expTex = this._tex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST, gl.CLAMP_TO_EDGE);
       this._expFbo = this._fbo(this._expTex);
     }
-    this._present(this._expFbo, w, h, true); // flipY so readPixels comes out top-first
+    if (this._composited) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this._expFbo); // left bound for readPixels below
+      gl.viewport(0, 0, w, h); gl.disable(gl.BLEND);
+      gl.useProgram(this.pBlit);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.panoTex);
+      gl.uniform1i(gl.getUniformLocation(this.pBlit, 'uSrc'), 0);
+      gl.uniform1f(gl.getUniformLocation(this.pBlit, 'uFlipY'), 1);
+      this._quad();
+    } else {
+      this._present(this._expFbo, w, h, true); // flipY so readPixels comes out top-first
+    }
     const px = new Uint8Array(w * h * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -353,4 +470,148 @@ export class PanoEngine {
     ctx.putImageData(img, 0, 0);
     return cvs;
   }
+
+  // ---- multi-band stitched compositor ------------------------------------
+  _initComposite() {
+    if (this._loFbo) return;
+    const gl = this.gl, w = this.size, h = this.h;
+    const hf = this._floatLinear ? gl.LINEAR : gl.NEAREST;
+    this.frameTex = this._tex(4, 4, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.CLAMP_TO_EDGE);
+    this.loTex = this._tex(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, hf, gl.REPEAT);
+    this.loFbo = this._fbo(this.loTex);
+    this.winTex = this._tex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.REPEAT);
+    this.winFbo = gl.createFramebuffer();
+    this.winDepth = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, this.winDepth);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.winFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.winTex, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, this.winDepth);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.tmpTex = this._tex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.REPEAT);
+    this.tmpFbo = this._fbo(this.tmpTex);
+    this.tmp2Tex = this._tex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.REPEAT);
+    this.tmp2Fbo = this._fbo(this.tmp2Tex);
+    this.winSmoothTex = this._tex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.REPEAT);
+    this.winSmoothFbo = this._fbo(this.winSmoothTex);
+  }
+
+  _uploadFrame(img) {
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  }
+
+  _blurInto(srcTex, dstFbo, spread) {
+    const gl = this.gl, w = this.size, h = this.h;
+    gl.useProgram(this.pBlur);
+    gl.disable(gl.BLEND);
+    // H pass: src -> tmp2
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.tmp2Fbo);
+    gl.viewport(0, 0, w, h);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, srcTex);
+    gl.uniform1i(gl.getUniformLocation(this.pBlur, 'uSrc'), 0);
+    gl.uniform2f(gl.getUniformLocation(this.pBlur, 'uStep'), spread / w, 0);
+    this._quad();
+    // V pass: tmp2 -> dst
+    gl.bindFramebuffer(gl.FRAMEBUFFER, dstFbo);
+    gl.viewport(0, 0, w, h);
+    gl.bindTexture(gl.TEXTURE_2D, this.tmp2Tex);
+    gl.uniform2f(gl.getUniformLocation(this.pBlur, 'uStep'), 0, spread / h);
+    this._quad();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  // frames: [{ img, R (row-major camera->world), gain }]. tanX/tanY: tan(fov/2)
+  // for the focal-corrected lens. Re-projects every frame with its solved pose
+  // via the proven splat pipeline (feathered weighted average) and bakes the
+  // result into panoTex. Frames are drawn most-central-last so tie regions
+  // favour well-exposed centres.
+  compositeStitched(frames, tanX, tanY) {
+    this.clear();
+    const gl = this.gl;
+    for (const fr of frames) {
+      this.splat(fr.img, matT3col(fr.R), tanX, tanY, 0, 0.28, fr.gain || 1);
+    }
+    this.bake();
+    this._composited = true;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  // (kept for a future device-tested pass) multi-band seam blend
+  compositeMultiBand(frames, tanX, tanY) {
+    const gl = this.gl, w = this.size, h = this.h;
+    this._initComposite();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.loFbo);
+    gl.viewport(0, 0, w, h); gl.disable(gl.BLEND);
+    gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.winFbo);
+    gl.viewport(0, 0, w, h);
+    gl.clearColor(0.01, 0.01, 0.015, 1); gl.clearDepth(1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    for (const fr of frames) {
+      const uRot = matT3col(fr.R);
+      this._uploadFrame(fr.img);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.winFbo);
+      gl.viewport(0, 0, w, h);
+      gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.depthMask(true);
+      gl.disable(gl.BLEND);
+      gl.useProgram(this.pWarpWin);
+      gl.uniformMatrix3fv(gl.getUniformLocation(this.pWarpWin, 'uRot'), false, uRot);
+      gl.uniform2f(gl.getUniformLocation(this.pWarpWin, 'uTan'), tanX, tanY);
+      gl.uniform1f(gl.getUniformLocation(this.pWarpWin, 'uGain'), fr.gain || 1);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
+      gl.uniform1i(gl.getUniformLocation(this.pWarpWin, 'uFrame'), 0);
+      this._quad();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.loFbo);
+      gl.viewport(0, 0, w, h);
+      gl.disable(gl.DEPTH_TEST);
+      gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD); gl.blendFunc(gl.ONE, gl.ONE);
+      gl.useProgram(this.pWarpLo);
+      gl.uniformMatrix3fv(gl.getUniformLocation(this.pWarpLo, 'uRot'), false, uRot);
+      gl.uniform2f(gl.getUniformLocation(this.pWarpLo, 'uTan'), tanX, tanY);
+      gl.uniform1f(gl.getUniformLocation(this.pWarpLo, 'uGain'), fr.gain || 1);
+      gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
+      gl.uniform1i(gl.getUniformLocation(this.pWarpLo, 'uFrame'), 0);
+      this._quad();
+      gl.disable(gl.BLEND);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.tmpFbo);
+    gl.viewport(0, 0, w, h); gl.disable(gl.BLEND);
+    gl.useProgram(this.pPresent);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.loTex);
+    gl.uniform1i(gl.getUniformLocation(this.pPresent, 'uAccum'), 0);
+    gl.uniform1f(gl.getUniformLocation(this.pPresent, 'uFlipY'), 0);
+    this._quad();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    const spread = Math.max(6, w / 220);
+    this._blurInto(this.tmpTex, this.tmpFbo, spread);
+    this._blurInto(this.winTex, this.winSmoothFbo, spread);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.panoFbo);
+    gl.viewport(0, 0, w, h); gl.disable(gl.BLEND);
+    gl.useProgram(this.pCombine);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tmpTex);
+    gl.uniform1i(gl.getUniformLocation(this.pCombine, 'uLo'), 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.winTex);
+    gl.uniform1i(gl.getUniformLocation(this.pCombine, 'uWin'), 1);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.winSmoothTex);
+    gl.uniform1i(gl.getUniformLocation(this.pCombine, 'uWinLo'), 2);
+    gl.uniform1f(gl.getUniformLocation(this.pCombine, 'uFlipY'), 0);
+    this._quad();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.activeTexture(gl.TEXTURE0);
+    this._composited = true;
+  }
+}
+
+// stitch rotations are row-major camera->world. uniformMatrix3fv reads
+// column-major, so pass the element-transpose: GLSL `uRot` then equals R and
+// `transpose(uRot) * world` = Rᵀ * world = the world dir in camera space.
+function matT3col(m) {
+  return new Float32Array([m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]);
 }

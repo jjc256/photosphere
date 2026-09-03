@@ -49,8 +49,9 @@ Alternatives that avoid the cert warning: run any static host
 3. Move slowly and pause. Frames are grabbed automatically when the phone is
    steady and has panned far enough (or tap the shutter yourself).
 4. Watch the grid fill in green. Sweep up and down too. Aim for ~90%+.
-5. Tap **Done** to review — drag to look around, pinch to zoom, toggle the flat
-   equirectangular view.
+5. Tap **Done**. The frames are stitched (a few seconds — "Stitching · …"),
+   then you land in the review viewer: drag to look around, pinch to zoom,
+   toggle the flat equirectangular view.
 6. Tap **Download 360° photo**. The file is saved via the browser's download /
    share sheet (Files, or share to Photos).
 
@@ -66,15 +67,27 @@ the rare browser that hands the camera feed sideways.
 | Piece | What it does |
 |---|---|
 | `js/orientation.js` | Turns iOS `deviceorientation` (`alpha/beta/gamma` + screen angle) into a camera→world rotation matrix (three.js `DeviceOrientationControls` math). |
-| `js/pano.js` | WebGL2 engine. Each captured frame is projected onto a `RGBA16F` **equirectangular accumulation buffer** with a pinhole model in the fragment shader, additively blended with an edge feather (`colour·w` in RGB, `w` in alpha). A normalise pass does `rgb / w`. Also renders the interactive sphere view and reads the panorama back for export. |
+| `js/orb.js` | Compact **ORB**: FAST-9 corners + non-max suppression, oriented BRIEF-256 descriptors, Hamming matcher with Lowe ratio test + cross-check. |
+| `js/ba.js` | Geometry back-end: SO(3) exp/log, homography RANSAC, **focal length from the homographies** (OpenCV `focalsFromHomography`), per-pair relative-rotation refinement (L2 Levenberg–Marquardt + IRLS outlier re-filter), **global L2 rotation averaging** anchored to the IMU, and **gain compensation**. |
+| `js/stitch.js` | Runs once on **Done**: detect features → match IMU-adjacent pairs → RANSAC-verify → median focal → refine each pair's rotation → keep the largest connected component → rotation-average → gain-compensate. Frames it can't connect keep their gyro pose; if matching is too weak overall it falls back to gyro alignment wholesale. |
+| `js/pano.js` | WebGL2 engine. `splat()` projects a frame onto an `RGBA16F` **equirectangular accumulation buffer** (pinhole model in the shader, edge-feathered weighted blend); `compositeStitched()` re-projects every frame with its solved pose + gain the same way and bakes the result. Also the live capture preview, the interactive sphere view, and equirect read-back for export. (`compositeMultiBand()` — a Laplacian seam blend — is present but not wired in; needs an on-device pass.) |
 | `js/xmp.js` | Builds the GPano XMP packet and splices metadata segments into the JPEG (EXIF then XMP, after `APP0`). |
 | `js/exif.js` | Hand-rolled big-endian **EXIF `APP1`** writer — GPS position, capture time, view direction — the tags Google Maps / Street View needs. |
-| `js/app.js` | Camera + permissions, the auto-capture heuristic (angular step ≈ 0.42 × FOV, only while steady), the coverage grid, the location watch, the review viewer, and export/download. |
+| `js/app.js` | Camera + permissions, the auto-capture heuristic (angular step ≈ 0.42 × FOV, only while steady), the coverage grid, per-frame stash (full-res `ImageData` + a downscaled luma copy for features), the location watch, the review viewer, and export/download. |
 | `sw.js` + `manifest.webmanifest` | Offline app shell and Home-Screen install. |
 
-Stitching is **orientation-based only** — no feature matching — so it's fast and
-works on a static scene shot from one spot. Distant scenes stitch best; close
-objects show seams from parallax.
+Stitching is **feature-based, seeded by the IMU**: the gyroscope gives a global
+first guess for every frame at once (no incremental drift), then ORB matches +
+rotation averaging pull the frames into photometric agreement and recover the
+true focal length. The device gyro is the fallback at every level — an
+unmatched frame, or a capture with too little overlap, still lands roughly
+right. Shoot from **one spot** (pivot around yourself); parallax from close
+objects is the residual limit that a pure-rotation model can't remove.
+
+`selftest.mjs` (`node selftest.mjs`) renders 12 synthetic views at known poses,
+feeds the solver noisy gyro seeds, and checks recovery — at 2.5–5° IMU noise all
+frames connect, per-frame rotation error drops from ~1.4° to ~0.35°, focal is
+recovered to <0.5%, and per-frame gains are recovered.
 
 ### Output
 
@@ -132,7 +145,8 @@ Uncovered parts of the sphere are left dark.
 ```
 index.html
 css/style.css
-js/{app,pano,orientation,xmp,exif}.js
+js/{app,pano,orientation,orb,ba,stitch,xmp,exif}.js
+selftest.mjs       # node selftest.mjs — synthetic stitcher check
 sw.js
 manifest.webmanifest
 icons/

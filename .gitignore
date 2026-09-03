@@ -1,4 +1,4 @@
-# Self-signed dev certificates (private key — never commit; regenerate with `node serve.mjs --cert`)
+# Self-signed dev certificates (private key — regenerate with `node serve.mjs --cert`)
 cert/
 
 # Dependencies / build output
@@ -11,4 +11,5 @@ dist/
 .vercel
 .netlify
 
-selftest.mjs
+# scratch
+comptest.html
