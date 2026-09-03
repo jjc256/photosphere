@@ -1,7 +1,6 @@
-// Minimal app-shell service worker: offline-capable, cache-first for static assets.
-// Keep this version in sync with APP_VERSION in js/app.js — bumping it evicts
-// the old cache so a redeploy actually ships.
-const CACHE = 'photosphere-0.5.1';
+// App-shell service worker. Network-first for everything (so a redeploy always
+// ships), cache only as an offline fallback.
+const CACHE = 'photosphere-0.5.2';
 const ASSETS = [
   './',
   './index.html',
@@ -36,22 +35,16 @@ self.addEventListener('fetch', (e) => {
   const url = new URL(request.url);
   if (url.origin !== location.origin) return;
 
-  // Navigation: network-first so updates land, fall back to cached shell offline.
-  if (request.mode === 'navigate') {
-    e.respondWith(
-      fetch(request).catch(() => caches.match('./index.html'))
-    );
-    return;
-  }
-
+  // Network-first: always try the network, cache the result, fall back to the
+  // cache (or the shell for navigations) only when offline.
   e.respondWith(
-    caches.match(request).then((hit) =>
-      hit ||
-      fetch(request).then((res) => {
+    fetch(request)
+      .then((res) => {
         const copy = res.clone();
         caches.open(CACHE).then((c) => c.put(request, copy)).catch(() => {});
         return res;
       })
-    )
+      .catch(() => caches.match(request).then((hit) =>
+        hit || (request.mode === 'navigate' ? caches.match('./index.html') : Response.error())))
   );
 });

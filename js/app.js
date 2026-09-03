@@ -7,7 +7,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.5.1';
+const APP_VERSION = '0.5.2';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -158,7 +158,8 @@ function fovTangents() {
 function resetCoverage() {
   state.shots = [];
   state.lastCapQuat = null;
-  state.steadyFrames = 0;
+  state._qHist = [];
+  state._steadySince = null;
   state.R0 = null;
   state._r0Deadline = performance.now() + 1600;
   buildTargets();
@@ -283,15 +284,20 @@ function worldToCam(R, w) {
 }
 
 function updateGuidance(now) {
-  if (state.speedQuat) {
-    const dt = (now - state.speedT) / 1000 || 1 / 60;
-    state.speed = quatAngle(state.quat, state.speedQuat) / dt;
-  }
-  state.speedQuat = state.quat;
-  state.speedT = now;
-  // being near-still for a few frames IS the anti-blur guard (like other apps)
-  state.steadyFrames = state.speed < 0.16 ? (state.steadyFrames || 0) + 1 : 0; // ≈9°/s
-  const steady = state.steadyFrames >= 4;
+  // Angular speed over a ~140 ms window. A per-frame delta is unreliable
+  // because deviceorientation events can arrive slower than the render loop
+  // (phantom "still" frames), so keep a short history and measure against a
+  // sample ~140 ms old.
+  const hist = state._qHist || (state._qHist = []);
+  hist.push({ t: now, q: state.quat });
+  while (hist.length > 2 && now - hist[0].t > 400) hist.shift();
+  let ref = hist[0];
+  for (const h of hist) { if (now - h.t >= 140) ref = h; else break; }
+  const span = (now - ref.t) / 1000;
+  state.speed = span > 0.02 ? quatAngle(state.quat, ref.q) / span : 0;
+  // steady = under ~9°/s continuously for 260 ms (the anti-blur guard)
+  if (state.speed > 0.16 || state._steadySince == null) state._steadySince = now;
+  const steady = now - state._steadySince > 260;
 
   if (!state.R0 && (state.hasOrientation || state.sim.active || now > state._r0Deadline)) {
     state.R0 = state.R.slice();
@@ -501,10 +507,12 @@ async function toReview() {
   }
   state._stitchLog = result.log || [];
   console.log('[stitch]', ...(result.log || []));
+  const nConn0 = (result.connected || []).filter(Boolean).length;
+  const partial = !result.ok || nConn0 < state.shots.length;
   const diag = $('stitch-diag');
-  diag.textContent = (result.log || []).join('\n');
-  diag.classList.toggle('err', !result.ok);
-  diag.hidden = result.ok;   // show automatically when it fell back; tap the chip to toggle
+  diag.textContent = `v${APP_VERSION}\n` + (result.log || []).join('\n');
+  diag.classList.toggle('err', partial);
+  diag.hidden = !partial;   // shows whenever anything went wrong; tap the count chip to toggle
 
   try {
     if (result.ok) {
