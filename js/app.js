@@ -7,7 +7,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.5.0';
+const APP_VERSION = '0.5.1';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -16,7 +16,6 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const MAX_SHOTS = 32;   // memory-bounded; ImageData is kept for the final blend
 const CAP_LONG = 1024;  // long side kept for compositing
 const GRAY_LONG = 512;  // long side used for feature detection
-const SHARP_MIN = 2.0;  // mean |gradient| floor — reject only badly motion-smeared frames
 
 const state = {
   stream: null,
@@ -200,10 +199,7 @@ function stashShot(manual) {
   for (let i = 0, p = 0; i < gray.length; i++, p += 4) {
     gray[i] = (d[p] * 77 + d[p + 1] * 150 + d[p + 2] * 29) >> 8;
   }
-  const sharp = sharpness(gray, sm.w, sm.h);
-  // auto-captured but clearly motion-blurred / featureless -> skip it
-  if (!manual && sharp < SHARP_MIN) { $('hint').textContent = 'Too blurry — hold still'; return false; }
-
+  const sharp = sharpness(gray, sm.w, sm.h); // kept only for near-duplicate eviction
   const big = grabFrame(CAP_LONG, vw, vh);
   state.shots.push({
     imgData: big.data, w: big.w, h: big.h,
@@ -293,8 +289,9 @@ function updateGuidance(now) {
   }
   state.speedQuat = state.quat;
   state.speedT = now;
-  state.steadyFrames = state.speed < 0.22 ? (state.steadyFrames || 0) + 1 : 0; // ≈13°/s
-  const steady = state.steadyFrames >= 3;
+  // being near-still for a few frames IS the anti-blur guard (like other apps)
+  state.steadyFrames = state.speed < 0.16 ? (state.steadyFrames || 0) + 1 : 0; // ≈9°/s
+  const steady = state.steadyFrames >= 4;
 
   if (!state.R0 && (state.hasOrientation || state.sim.active || now > state._r0Deadline)) {
     state.R0 = state.R.slice();
@@ -324,27 +321,18 @@ function updateGuidance(now) {
   }
   state.activeTarget = act;
 
-  const CONE = 8 * DEG, FILL = 0.85;
-  let stuck = false;
+  const CONE = 8 * DEG, FILL = 0.7;
   for (let i = 0; i < state.targets.length; i++) {
     const t = state.targets[i];
     if (t.done) continue;
     const on = i === act && t._ang < CONE && steady;
-    t.progress = clamp(t.progress + (on ? dt / FILL : -dt / 0.35), 0, 1);
-    if (t.progress >= 1 && on) {
-      // ring full: keep trying every frame until a sharp grab lands — the ring
-      // just sits full rather than looping, and the dot stays open if you move on
-      if (doCapture(false)) { t.done = true; t.progress = 1; t.stuckFrames = 0; }
-      else { t.stuckFrames = (t.stuckFrames || 0) + 1; if (t.stuckFrames > 20) stuck = true; }
-    } else if (!on) {
-      t.stuckFrames = 0;
-    }
+    t.progress = clamp(t.progress + (on ? dt / FILL : -dt / 0.3), 0, 1);
+    if (t.progress >= 1 && on && doCapture(false)) { t.done = true; t.progress = 1; }
   }
 
   const done = state.targets.filter((t) => t.done).length;
   $('coverage').textContent = `${done}/${state.targets.length}`;
   if (done === state.targets.length) hint.textContent = 'All dots captured — tap Done';
-  else if (stuck) hint.textContent = 'Too blurry here — steady the phone';
   else if (act >= 0 && state.targets[act]._ang < CONE) hint.textContent = steady ? 'Hold…' : 'Hold still';
   else hint.textContent = 'Aim at the nearest dot';
 }
