@@ -14,7 +14,7 @@
 import { detectAndDescribe, matchDescriptors } from './orb.js';
 import {
   ransacHomography, focalFromHomography, relRotFromHomography, refineRelRot,
-  rotationAverage, gainCompensate, qToR, matMul3, matT3, logSO3,
+  rotationAverage, bundleAdjust, gainCompensate, qToR, matMul3, matT3, logSO3,
 } from './ba.js';
 
 const DEG = Math.PI / 180;
@@ -49,7 +49,9 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   log.push(`features: ${counts.join(',')}`);
   log.push(`usable frames (>=60 feat): ${usable}/${N}`);
 
-  // 2. candidate pairs: IMU-adjacent (bounded fan-out) + every consecutive pair
+  // 2. candidate pairs: IMU-adjacent (bounded fan-out) + capture neighbours.
+  // This mirrors a panorama matcher’s overlap graph while staying practical in
+  // the browser: exhaustive ORB matching across 50 full frames is too costly.
   // (capture order tracks a sweep, and covers the case where the gyro is dead).
   const maxAng = Math.min(hfov * 1.15, 1.4);
   const seen = new Set();
@@ -66,12 +68,12 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
       if (a < maxAng) near.push([j, a]);
     }
     near.sort((p, q) => p[1] - q[1]);
-    for (const [j] of near.slice(0, 7)) addPair(i, j);
+    for (const [j] of near.slice(0, 10)) addPair(i, j);
   }
   // capture-order neighbours: with ~15° steps and a ~46° lens, frames up to
-  // three apart still overlap, which bridges a single textureless frame.
+  // four apart still overlap, which bridges a short textureless stretch.
   for (let i = 0; i + 1 < N; i++) {
-    for (let d = 1; d <= 3 && i + d < N; d++) addPair(i, i + d);
+    for (let d = 1; d <= 4 && i + d < N; d++) addPair(i, i + d);
   }
 
   // 3. match + homography verification
@@ -175,7 +177,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     // accept a pair if it aligns tightly, OR loosely but with lots of inliers
     // (wide-baseline / mild parallax pairs still anchor the graph)
     if (inl >= 10 && (rms < 4 || (rms < 6.5 && inl >= 25))) {
-      edges.push({ i: v.i, j: v.j, Rrel, w: Math.min(inl, 120) }); UF.union(v.i, v.j);
+      edges.push({ i: v.i, j: v.j, Rrel, w: Math.min(inl, 120), mc: v.mc }); UF.union(v.i, v.j);
     }
     v.rms = rms;
     await tick();
@@ -195,16 +197,47 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   const connected = root.map((r) => sizeOf[r] > 1);       // has at least one match
   const comps = Object.values(sizeOf).filter((n) => n > 1).sort((a, b) => b - a);
   log.push(`refined ${connected.filter(Boolean).length}/${N} in ${comps.length} clusters [${comps.join(',')}]`);
+  // A pair is evidence of local agreement. Three or more connected frames are
+  // the minimum for a component to be trusted at a panorama seam.
+  const reliable = root.map((r) => sizeOf[r] >= 3);
+  log.push(`coherent frames: ${reliable.filter(Boolean).length}/${N}`);
 
   // 7. rotation averaging over the whole graph at once — nodes with no edge
   // simply fall back to their prior, every cluster is solved in place.
   onProgress('optimizing', 0.7);
   const avg = rotationAverage(N, edges, gyroR, { priorW: 0.2, iters: 60 });
-  const rotations = gyroR.map((g, k) => {
+  let rotations = gyroR.map((g, k) => {
     if (!connected[k]) return g;
     const drift = Math.hypot(...logSO3(matMul3(avg[k], matT3(g))));
     return drift < 0.5 && avg[k].every((v) => isFinite(v)) ? avg[k] : g;
   });
+
+  // 7b. Global reprojection refinement, component by component. Rotation
+  // averaging makes pair constraints consistent; bundle adjustment then moves
+  // all cameras in a component together to minimise their feature error.
+  const members = new Map();
+  root.forEach((r, i) => { if (!members.has(r)) members.set(r, []); members.get(r).push(i); });
+  let baCount = 0;
+  for (const ids of members.values()) {
+    if (ids.length < 3 || ids.length > 12) continue;
+    const local = new Map(ids.map((id, k) => [id, k]));
+    const pairs = edges.filter((e) => local.has(e.i) && local.has(e.j)).map((e) => ({
+      i: local.get(e.i), j: local.get(e.j),
+      m: e.mc.map(([xi, yi, xj, yj]) => [xi + cx, yi + cy, xj + cx, yj + cy]),
+    }));
+    if (pairs.length < ids.length - 1) continue;
+    try {
+      const ba = bundleAdjust(ids.map(() => ({ w, h })), ids.map((id) => rotations[id]), pairs, {
+        focal0: focal, cx, cy, k1, optimizeFocal: false, priorW: 0.08, huber: 5, iters: 10,
+      });
+      if (ba.R.every((R) => R.every((v) => isFinite(v)))) {
+        ids.forEach((id, k) => { rotations[id] = ba.R[k]; });
+        baCount++;
+      }
+    } catch { /* keep the rotation-average result for this component */ }
+    await tick();
+  }
+  if (baCount) log.push(`bundle-adjusted ${baCount} match component${baCount === 1 ? '' : 's'}`);
   onProgress('optimizing', 1);
 
   // 8. gain compensation over every matched pair
@@ -220,7 +253,10 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     sub.forEach((orig, k) => { gains[orig] = clamp(gg[k], 0.6, 1.6); });
   }
 
-  return { rotations, focalScale: focal / focal0, k1, gains, connected, ok: true, log };
+  // Small isolated components are locally aligned but not tied to the broader
+  // panorama. Render them as weak evidence so a tiny island cannot overwrite
+  // a larger, coherent view at a seam.
+  return { rotations, focalScale: focal / focal0, k1, gains, connected, reliable, ok: true, log };
 }
 
 class UnionFind {

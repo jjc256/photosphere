@@ -404,7 +404,8 @@ function weightedQuatAvg(list) {
 // pairs:  [{ i, j, m: [[xi,yi,xj,yj], ...] }]  verified inlier matches
 // Returns { R: [mat3], focal, cost }
 export function bundleAdjust(frames, gyroR, pairs, {
-  focal0, cx, cy, priorW = 0.05, huber = 12, iters = 40, anchor = 0,
+  focal0, cx, cy, k1 = 0, optimizeFocal = true,
+  priorW = 0.05, huber = 12, iters = 40, anchor = 0,
 } = {}) {
   const N = frames.length;
   const theta = new Float64Array(3 * N + 1); // R_k = exp(theta_k)·gyroR_k, f = focal0·e^t
@@ -415,7 +416,7 @@ export function bundleAdjust(frames, gyroR, pairs, {
   // equations are full rank.
   const active = [];
   for (let k = 0; k < N; k++) if (k !== anchor) active.push(k * 3, k * 3 + 1, k * 3 + 2);
-  active.push(FI);
+  if (optimizeFocal) active.push(FI);
   const P = active.length;
 
   const curR = (t) => {
@@ -431,10 +432,12 @@ export function bundleAdjust(frames, gyroR, pairs, {
     for (const pr of pairs) {
       const Rrel = matMul3(matT3(R[pr.j]), R[pr.i]); // cam i -> world -> cam j
       for (const [xi, yi, xj, yj] of pr.m) {
-        const d = matVec3(Rrel, [(xi - cx) / f, (yi - cy) / f, -1]); // camera looks -Z
+        const u = undistortPt((xi - cx) / f, (yi - cy) / f, k1);
+        const d = matVec3(Rrel, [u[0], u[1], -1]); // camera looks -Z
         const z = Math.min(d[2], -0.05);              // smooth clamp (no behind-camera spikes)
-        let rx = cx - f * (d[0] / z) - xj;
-        let ry = cy - f * (d[1] / z) - yj;
+        const p = distortPt(-d[0] / z, -d[1] / z, k1);
+        let rx = cx + f * p[0] - xj;
+        let ry = cy + f * p[1] - yj;
         const r = Math.hypot(rx, ry);
         if (r > huber) { const s = Math.sqrt(huber / r); rx *= s; ry *= s; }
         res.push(rx, ry);
@@ -443,7 +446,7 @@ export function bundleAdjust(frames, gyroR, pairs, {
     for (let k = 0; k < N; k++) {
       res.push(priorW * t[k * 3], priorW * t[k * 3 + 1], priorW * t[k * 3 + 2]);
     }
-    res.push(0.15 * t[FI]); // gentle focal prior
+    if (optimizeFocal) res.push(0.15 * t[FI]); // gentle focal prior
     return res;
   };
 

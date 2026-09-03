@@ -8,7 +8,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.8.1';
+const APP_VERSION = '0.8.2';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -571,14 +571,15 @@ async function toReview() {
       // Composite the aligned frames at full seam priority; unaligned frames
       // are passed too but marked `weak` so they only fill gaps the aligned
       // ones don't cover (better than a black hole).
-      const nConn = result.connected.filter(Boolean).length;
+      const reliable = result.reliable || result.connected;
+      const nReliable = reliable.filter(Boolean).length;
       const parts = state.shots.map((s, k) => ({
         img: s.imgData, R: result.rotations[k], gain: result.gains[k],
-        weak: nConn >= 3 && !result.connected[k],
+        weak: nReliable >= 3 && !reliable[k],
         vidRot: s.vidRot,
       }));
       state.engine.compositeStitched(parts, tanX, tanY, result.k1 || 0);
-      if (nConn < state.shots.length) toast(`Aligned ${nConn} of ${state.shots.length} frames`);
+      if (nReliable < state.shots.length) toast(`Using ${nReliable} verified frames of ${state.shots.length}`);
     } else {
       state.engine.bake(); // gyro-only fallback (from the live splat accumulation)
       toast('Feature match failed — using gyro alignment');
