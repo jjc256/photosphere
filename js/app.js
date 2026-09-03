@@ -8,13 +8,13 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.7.0';
+const APP_VERSION = '0.7.1';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 // ---- captured-frame budget --------------------------------------------------
-const MAX_SHOTS = 44;   // memory-bounded; ImageData is kept for the final blend
+const MAX_SHOTS = 50;   // memory-bounded; ImageData is kept for the final blend
 const CAP_LONG = 800;   // long side kept for compositing
 const GRAY_LONG = 512;  // long side used for feature detection
 const CAP_STEP = 14 * Math.PI / 180; // grab a frame every ~14° of pan (overlap guarantee)
@@ -215,12 +215,13 @@ function stashShot(manual) {
     quat: state.quat.slice(), hfovDeg: state.hfovDeg,
   });
   if (state.shots.length > MAX_SHOTS) {
-    // drop the weaker of the closest-together pair (blurrier frame loses)
+    // over budget: drop one of the closest-together pair (so unique coverage is
+    // never lost), preferring to keep whichever has more matchable detail
     let bi = 0, bd = Infinity;
     for (let i = 0; i < state.shots.length; i++) {
       for (let j = i + 1; j < state.shots.length; j++) {
         const a = quatAngle(state.shots[i].quat, state.shots[j].quat);
-        if (a < bd) { bd = a; bi = state.shots[i].sharp <= state.shots[j].sharp ? i : j; }
+        if (a < bd) { bd = a; bi = state.shots[i].feat <= state.shots[j].feat ? i : j; }
       }
     }
     state.shots.splice(bi, 1);

@@ -68,7 +68,11 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     near.sort((p, q) => p[1] - q[1]);
     for (const [j] of near.slice(0, 7)) addPair(i, j);
   }
-  for (let i = 0; i + 1 < N; i++) { addPair(i, i + 1); addPair(i, Math.min(i + 2, N - 1)); }
+  // capture-order neighbours: with ~15° steps and a ~46° lens, frames up to
+  // three apart still overlap, which bridges a single textureless frame.
+  for (let i = 0; i + 1 < N; i++) {
+    for (let d = 1; d <= 3 && i + d < N; d++) addPair(i, i + d);
+  }
 
   // 3. match + homography verification
   const verified = []; // { i, j, mc:[centered matches], inl, Ii, Ij, H }
@@ -142,18 +146,22 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   log.push('pairs: ' + verified.map((v) => `${v.i}-${v.j}:${(v.rms || 9).toFixed(1)}/${v.inl}`).join(' '));
   if (edges.length === 0) return bail();
 
-  // 6. largest connected component
+  // 6. connected components. A low-texture stretch (blank wall, sky) breaks
+  // the match graph into several clusters; each is still internally solvable,
+  // so refine EVERY cluster rather than keeping only the biggest and throwing
+  // the rest back to raw gyro. Clusters are placed relative to each other by
+  // the gyro prior, which is what it is good at.
   const root = Array.from({ length: N }, (_, i) => UF.find(i));
-  const cnt = {};
-  root.forEach((r) => (cnt[r] = (cnt[r] || 0) + 1));
-  const big = +Object.entries(cnt).sort((a, b) => b[1] - a[1])[0][0];
-  const connected = root.map((r) => r === big);
-  log.push(`connected ${connected.filter(Boolean).length}/${N}`);
+  const sizeOf = {};
+  root.forEach((r) => (sizeOf[r] = (sizeOf[r] || 0) + 1));
+  const connected = root.map((r) => sizeOf[r] > 1);       // has at least one match
+  const comps = Object.values(sizeOf).filter((n) => n > 1).sort((a, b) => b - a);
+  log.push(`refined ${connected.filter(Boolean).length}/${N} in ${comps.length} clusters [${comps.join(',')}]`);
 
-  // 7. global rotation averaging (anchored softly to the gyro)
+  // 7. rotation averaging over the whole graph at once — nodes with no edge
+  // simply fall back to their prior, every cluster is solved in place.
   onProgress('optimizing', 0.7);
-  const subEdges = edges.filter((e) => connected[e.i] && connected[e.j]);
-  const avg = rotationAverage(N, subEdges, gyroR, { priorW: 0.2, iters: 60 });
+  const avg = rotationAverage(N, edges, gyroR, { priorW: 0.2, iters: 60 });
   const rotations = gyroR.map((g, k) => {
     if (!connected[k]) return g;
     const drift = Math.hypot(...logSO3(matMul3(avg[k], matT3(g))));
@@ -161,7 +169,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   });
   onProgress('optimizing', 1);
 
-  // 8. gain compensation over connected pairs
+  // 8. gain compensation over every matched pair
   const gains = shots.map(() => 1);
   const idxOf = [];
   const sub = [];
