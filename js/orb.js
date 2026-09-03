@@ -65,6 +65,36 @@ const PATTERN = (() => {
 
 const POP = (() => { const t = new Uint8Array(256); for (let i = 0; i < 256; i++) t[i] = (i & 1) + t[i >> 1]; return t; })();
 
+// Cheap FAST-only corner count (no descriptors) — used at capture time to
+// reject frames the stitcher won't be able to use (blur / blank / dark).
+export function countCorners(gray, w, h, fastThresh = 14) {
+  const border = 6;
+  let n = 0;
+  for (let y = border; y < h - border; y += 2) {
+    for (let x = border; x < w - border; x += 2) {
+      const v = gray[y * w + x];
+      const hi = v + fastThresh, lo = v - fastThresh;
+      let brighter = 0, darker = 0;
+      for (const idx of [0, 4, 8, 12]) {
+        const s = gray[(y + CIRCLE[idx][1]) * w + x + CIRCLE[idx][0]];
+        if (s > hi) brighter++; else if (s < lo) darker++;
+      }
+      if (brighter < 3 && darker < 3) continue;
+      let best = 0, run = 0, sign = 0;
+      for (let i = 0; i < 24; i++) {
+        const c = CIRCLE[i % 16];
+        const s = gray[(y + c[1]) * w + x + c[0]];
+        const cur = s > hi ? 1 : s < lo ? -1 : 0;
+        if (cur !== 0 && cur === sign) run++;
+        else { sign = cur; run = cur !== 0 ? 1 : 0; }
+        if (run > best) best = run;
+      }
+      if (best >= 9) n++;
+    }
+  }
+  return n; // sampled on a 2px grid, so roughly 1/4 of the true count
+}
+
 export function detectAndDescribe(gray, w, h, {
   fastThresh = 20, maxFeatures = 700, nmsRadius = 7, blurPasses = 1, minKeypoints = 90, _depth = 0,
 } = {}) {

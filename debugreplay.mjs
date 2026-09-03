@@ -20,7 +20,7 @@ const shots = d.shots.map((s) => ({
   w: s.gw, h: s.gh, quat: s.quat, hfovDeg: s.hfovDeg ?? d.hfovDeg,
 }));
 
-console.log('per-frame: size  meanGray min..max  stddev  ORBfeatures');
+console.log("per-frame: size  meanGray min..max  stddev  ORBfeat  captureFeat");
 for (let i = 0; i < shots.length; i++) {
   const g = shots[i].gray;
   let sum = 0, mn = 255, mx = 0;
@@ -34,8 +34,18 @@ for (let i = 0; i < shots.length; i++) {
   console.log(
     `  f${String(i).padStart(2)}  ${shots[i].w}x${shots[i].h}  ` +
     `${mean.toFixed(0).padStart(3)}  ${String(mn).padStart(3)}..${String(mx).padEnd(3)}  ` +
-    `${sd.toFixed(1).padStart(5)}  ${f.kps.length}`);
+    `${sd.toFixed(1).padStart(5)}  ${String(f.kps.length).padStart(4)}  ${d.shots[i].feat ?? "-"}`);
 }
+// angular gap between consecutive captures (should be ~CAP_STEP, ~14°)
+const ang = (a, b) => {
+  const d = Math.abs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]);
+  return 2 * Math.acos(Math.min(1, d)) * 180 / Math.PI;
+};
+const gaps = [];
+for (let i = 1; i < shots.length; i++) gaps.push(ang(shots[i - 1].quat, shots[i].quat));
+console.log('consec gaps (deg):', gaps.map((g) => g.toFixed(0)).join(' '));
+console.log('  median', gaps.slice().sort((a, b) => a - b)[gaps.length >> 1]?.toFixed(1),
+  ' max', Math.max(...gaps).toFixed(0));
 console.log('');
 
 const res = await stitch(shots, { onProgress: () => {} });

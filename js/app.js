@@ -1,5 +1,6 @@
 import { PanoEngine } from './pano.js';
 import { stitch } from './stitch.js';
+import { countCorners } from './orb.js';
 import { buildGPanoXMP, embedMetadata } from './xmp.js';
 import { buildExifSegment } from './exif.js';
 import {
@@ -7,7 +8,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.5.5';
+const APP_VERSION = '0.5.6';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -201,11 +202,16 @@ function stashShot(manual) {
   for (let i = 0, p = 0; i < gray.length; i++, p += 4) {
     gray[i] = (d[p] * 77 + d[p + 1] * 150 + d[p + 2] * 29) >> 8;
   }
-  const sharp = sharpness(gray, sm.w, sm.h); // kept only for near-duplicate eviction
+  const feat = countCorners(gray, sm.w, sm.h);
+  state._lastFeat = feat;
+  // reject frames the stitcher can't use — blur, blank wall, too dark
+  if (!manual && feat < 14) { $('hint').textContent = 'Too little detail / too blurry here'; return false; }
+
+  const sharp = sharpness(gray, sm.w, sm.h); // for near-duplicate eviction
   const big = grabFrame(CAP_LONG, vw, vh);
   state.shots.push({
     imgData: big.data, w: big.w, h: big.h,
-    gray, gw: sm.w, gh: sm.h, sharp,
+    gray, gw: sm.w, gh: sm.h, sharp, feat,
     quat: state.quat.slice(), hfovDeg: state.hfovDeg,
   });
   if (state.shots.length > MAX_SHOTS) {
@@ -350,11 +356,14 @@ function updateGuidance(now) {
   }
 
   const done = state.targets.filter((t) => t.done).length;
-  $('coverage').textContent = `${done}/${state.targets.length}`;
+  const lf = state._lastFeat;
+  $('coverage').textContent =
+    `${state.shots.length}f` + (lf != null ? ` · ${lf < 14 ? '⚠' : ''}${lf}` : '');
   if (state.shots.length >= MAX_SHOTS) hint.textContent = 'Plenty of frames — tap Done';
-  else if (done === state.targets.length) hint.textContent = 'All dots done — tap Done';
+  else if (done === state.targets.length) hint.textContent = 'Dots done — a pass up & down, then Done';
   else if (state.speed >= 0.45) hint.textContent = 'Slow down a little';
-  else hint.textContent = `Sweep toward the next dot · ${state.shots.length}`;
+  else if (grabbed && lf != null && lf < 20) hint.textContent = 'Aim at more textured things';
+  else hint.textContent = 'Sweep slowly toward the next dot';
 }
 
 function drawGuide() {
@@ -615,7 +624,7 @@ function saveDebugData() {
     stitchLog: state._stitchLog || [],
     shots: state.shots.map((s) => ({
       gw: s.gw, gh: s.gh, w: s.w, h: s.h, quat: s.quat, hfovDeg: s.hfovDeg,
-      sharp: s.sharp, grayB64: b64(s.gray),
+      sharp: s.sharp, feat: s.feat, grayB64: b64(s.gray),
     })),
   };
   const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
