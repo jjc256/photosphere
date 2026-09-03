@@ -4,17 +4,13 @@ import { buildGPanoXMP, embedMetadata } from './xmp.js';
 import { buildExifSegment } from './exif.js';
 import {
   DEG, deviceQuat, quatToMat3, yawPitchToMat3, quatFromAxisAngle,
-  multiplyQuat, normalizeQuat, quatAngle, forwardDir, inFrustum,
+  multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.4.2';
+const APP_VERSION = '0.4.3';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-
-// ---- panorama coverage grid ----------------------------------------------
-const NCOL = 24, NROW = 8;
-const LAT_MAX = 62, LAT_MIN = -62; // degrees; poles are hard to shoot hand-held
 
 // ---- captured-frame budget --------------------------------------------------
 const MAX_SHOTS = 32;   // memory-bounded; ImageData is kept for the final blend
@@ -36,9 +32,10 @@ const state = {
   hfovDeg: 55,
   vidRot: 0,
   autoCap: true,
-  covered: new Set(),
-  shots: [],          // { imgData, w, h, gray, gw, gh, quat, hfovDeg }
-  cells: [],
+  shots: [],          // { imgData, w, h, gray, gw, gh, sharp, quat, hfovDeg }
+  targets: [],        // guided-capture dots: { dir, done, progress }
+  R0: null,           // camera->world at capture start (target lattice reference)
+  activeTarget: -1,
   raf: 0,
   running: false,
   lastPreview: 0,
@@ -158,67 +155,15 @@ function fovTangents() {
   return { tanX, tanY };
 }
 
-// ---- coverage grid ----------------------------------------------------------
-function buildGrid() {
-  const grid = $('grid');
-  grid.style.gridTemplateColumns = `repeat(${NCOL}, 1fr)`;
-  grid.style.gridTemplateRows = `repeat(${NROW}, 1fr)`;
-  grid.innerHTML = '';
-  state.cells = [];
-  for (let r = 0; r < NROW; r++) {
-    for (let c = 0; c < NCOL; c++) {
-      const d = document.createElement('div');
-      d.className = 'cell';
-      grid.appendChild(d);
-      state.cells.push(d);
-    }
-  }
-}
-
-function cellWorld(c, r) {
-  const lon = ((c + 0.5) / NCOL) * 2 * Math.PI - Math.PI;
-  const lat = (LAT_MAX - ((r + 0.5) / NROW) * (LAT_MAX - LAT_MIN)) * DEG;
-  const cl = Math.cos(lat);
-  return [cl * Math.sin(lon), Math.sin(lat), -cl * Math.cos(lon)];
-}
-
+// ---- capture reset --------------------------------------------------------
 function resetCoverage() {
-  state.covered.clear();
   state.shots = [];
   state.lastCapQuat = null;
-  $('coverage').textContent = '0%';
-  for (const d of state.cells) d.classList.remove('covered', 'current');
-}
-
-function markCovered(R, tanX, tanY) {
-  for (let r = 0; r < NROW; r++) {
-    for (let c = 0; c < NCOL; c++) {
-      const w = cellWorld(c, r);
-      if (inFrustum(R, w[0], w[1], w[2], tanX * 0.8, tanY * 0.8)) {
-        state.covered.add(r * NCOL + c);
-      }
-    }
-  }
-  $('coverage').textContent =
-    Math.round((state.covered.size / (NCOL * NROW)) * 100) + '%';
-}
-
-function refreshGridClasses() {
-  const f = forwardDir(state.R);
-  const lon = Math.atan2(f[0], -f[2]);
-  const lat = Math.asin(clamp(f[1], -1, 1));
-  let cur = -1;
-  if (lat <= LAT_MAX * DEG && lat >= LAT_MIN * DEG) {
-    const c = ((Math.floor(((lon + Math.PI) / (2 * Math.PI)) * NCOL)) % NCOL + NCOL) % NCOL;
-    const r = clamp(
-      Math.floor(((LAT_MAX * DEG - lat) / ((LAT_MAX - LAT_MIN) * DEG)) * NROW), 0, NROW - 1);
-    cur = r * NCOL + c;
-  }
-  for (let i = 0; i < state.cells.length; i++) {
-    const d = state.cells[i];
-    d.classList.toggle('covered', state.covered.has(i));
-    d.classList.toggle('current', i === cur);
-  }
+  state.steadyFrames = 0;
+  state.R0 = null;
+  state._r0Deadline = performance.now() + 1600;
+  buildTargets();
+  $('coverage').textContent = '0/0';
 }
 
 // ---- capture --------------------------------------------------------------
@@ -257,7 +202,7 @@ function stashShot(manual) {
   }
   const sharp = sharpness(gray, sm.w, sm.h);
   // auto-captured but clearly motion-blurred / featureless -> skip it
-  if (!manual && sharp < SHARP_MIN) { $('hint').textContent = 'Too blurry — hold still'; return; }
+  if (!manual && sharp < SHARP_MIN) { $('hint').textContent = 'Too blurry — hold still'; return false; }
 
   const big = grabFrame(CAP_LONG, vw, vh);
   state.shots.push({
@@ -276,49 +221,189 @@ function stashShot(manual) {
     }
     state.shots.splice(bi, 1);
   }
+  return true;
 }
 
 function doCapture(manual) {
-  if (!video.videoWidth) return;
+  if (!video.videoWidth) return false;
   updateOrientation(); // capture against the freshest pose
   const { tanX, tanY } = fovTangents();
-  state.engine.splat(video, state.R, tanX, tanY, state.vidRot); // live guide preview
-  stashShot(manual);                                            // for the real stitch on Done
+  const ok = stashShot(manual);                                   // for the real stitch on Done
+  if (!ok) return false;
+  state.engine.splat(video, state.R, tanX, tanY, state.vidRot);   // live guide preview
   state.lastCapQuat = state.quat;
-  markCovered(state.R, tanX, tanY);
   const s = $('btn-shutter');
   s.classList.remove('flash');
   void s.offsetWidth;
   s.classList.add('flash');
   if (navigator.vibrate) navigator.vibrate(manual ? 25 : 12);
+  return true;
 }
 
-function maybeAutoCapture(now) {
+// ---- guided capture targets (aim → hold → ring fills → snap) --------------
+// A lattice of dots on the sphere, spaced ~60% of the field of view so
+// neighbouring shots overlap enough to stitch. Sized to the current FOV.
+function buildTargets() {
+  const fov = state.hfovDeg || 55;
+  const eqN = clamp(Math.round(360 / (fov * 0.6)), 8, 16);
+  const midP = fov * 0.52, highP = Math.min(72, fov * 1.05);
+  const rings = [
+    { p: 0, n: eqN },
+    { p: midP, n: Math.max(6, Math.round(eqN * 0.82)) },
+    { p: -midP, n: Math.max(6, Math.round(eqN * 0.82)) },
+    { p: highP, n: Math.max(4, Math.round(eqN * 0.5)) },
+    { p: -highP, n: Math.max(4, Math.round(eqN * 0.5)) },
+  ];
+  const T = [];
+  rings.forEach((r, ri) => {
+    const off = ri % 2 ? 180 / r.n : 0; // stagger alternate rings
+    for (let i = 0; i < r.n; i++) {
+      const y = (i * 360 / r.n + off) * DEG, p = r.p * DEG, cp = Math.cos(p);
+      T.push({ dir: [cp * Math.sin(y), Math.sin(p), -cp * Math.cos(y)], done: false, progress: 0 });
+    }
+  });
+  T.push({ dir: [0, 1, 0], done: false, progress: 0 });   // straight up
+  T.push({ dir: [0, -1, 0], done: false, progress: 0 });   // straight down
+  state.targets = T;
+  state.activeTarget = -1;
+}
+
+// world dir of a ref-frame target: R0 (camera->world, column-major) · v
+function refToWorld(R0, v) {
+  return [
+    R0[0] * v[0] + R0[3] * v[1] + R0[6] * v[2],
+    R0[1] * v[0] + R0[4] * v[1] + R0[7] * v[2],
+    R0[2] * v[0] + R0[5] * v[1] + R0[8] * v[2],
+  ];
+}
+// world dir -> camera space (Rᵀ·w for a column-major camera->world R)
+function worldToCam(R, w) {
+  return [
+    R[0] * w[0] + R[1] * w[1] + R[2] * w[2],
+    R[3] * w[0] + R[4] * w[1] + R[5] * w[2],
+    R[6] * w[0] + R[7] * w[1] + R[8] * w[2],
+  ];
+}
+
+function updateGuidance(now) {
   if (state.speedQuat) {
     const dt = (now - state.speedT) / 1000 || 1 / 60;
     state.speed = quatAngle(state.quat, state.speedQuat) / dt;
   }
   state.speedQuat = state.quat;
   state.speedT = now;
-
-  // require several consecutive slow frames — a phone still mid-swing blurs
-  state.steadyFrames = state.speed < 0.22 ? (state.steadyFrames || 0) + 1 : 0; // rad/s ≈ 13°/s
+  state.steadyFrames = state.speed < 0.22 ? (state.steadyFrames || 0) + 1 : 0; // ≈13°/s
   const steady = state.steadyFrames >= 3;
 
+  if (!state.R0 && (state.hasOrientation || state.sim.active || now > state._r0Deadline)) {
+    state.R0 = state.R.slice();
+  }
+
+  const dt = Math.min(0.05, (now - (state._guideT || now)) / 1000);
+  state._guideT = now;
   const hint = $('hint');
+
+  if (!state.R0 || !state.targets.length) { hint.textContent = 'Getting your bearings…'; return; }
   if (!state.autoCap) { hint.textContent = 'Tap the shutter to grab a frame'; return; }
 
-  const moved = state.lastCapQuat ? quatAngle(state.quat, state.lastCapQuat) : Infinity;
-  const step = (state.hfovDeg * DEG) * 0.42;
-
-  if (state.engine.frames === 0) {
-    hint.textContent = steady ? 'Capturing…' : 'Hold steady to start';
-    if (steady) doCapture(false);
-    return;
+  const aim = forwardDir(state.R);
+  let act = -1, actAng = Infinity;
+  for (let i = 0; i < state.targets.length; i++) {
+    const t = state.targets[i];
+    if (t.done) continue;
+    t._w = refToWorld(state.R0, t.dir);
+    t._ang = Math.acos(clamp(aim[0] * t._w[0] + aim[1] * t._w[1] + aim[2] * t._w[2], -1, 1));
+    if (t._ang < actAng) { actAng = t._ang; act = i; }
   }
-  if (!steady) hint.textContent = 'Pause to capture';
-  else if (moved < step) hint.textContent = 'Pan to a new area';
-  else { hint.textContent = 'Capturing…'; doCapture(false); }
+  state.activeTarget = act;
+
+  const CONE = 8 * DEG, FILL = 0.85;
+  for (let i = 0; i < state.targets.length; i++) {
+    const t = state.targets[i];
+    if (t.done) continue;
+    const on = i === act && t._ang < CONE && steady;
+    t.progress = clamp(t.progress + (on ? dt / FILL : -dt / 0.35), 0, 1);
+    if (t.progress >= 1) {
+      if (doCapture(false)) { t.done = true; t.progress = 1; }
+      else { t.progress = 0.4; }
+    }
+  }
+
+  const done = state.targets.filter((t) => t.done).length;
+  $('coverage').textContent = `${done}/${state.targets.length}`;
+  if (done === state.targets.length) hint.textContent = 'All dots captured — tap Done';
+  else if (act >= 0 && state.targets[act]._ang < CONE) hint.textContent = steady ? 'Hold…' : 'Hold still';
+  else hint.textContent = 'Aim at the nearest dot';
+}
+
+function drawGuide() {
+  const cv = $('guide');
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const cw = Math.round(cv.clientWidth * dpr), ch = Math.round(cv.clientHeight * dpr);
+  if (cv.width !== cw || cv.height !== ch) { cv.width = cw; cv.height = ch; }
+  const g = cv.getContext('2d');
+  g.clearRect(0, 0, cw, ch);
+  if (!state.R0 || !state.targets.length) return;
+
+  const { tanX, tanY } = fovTangents();
+  const project = (w) => {
+    const c = worldToCam(state.R, w);
+    if (c[2] >= -1e-3) return null;
+    const sx = (c[0] / -c[2]) / tanX, sy = (c[1] / -c[2]) / tanY;
+    return { sx, sy, x: (sx * 0.5 + 0.5) * cw, y: (0.5 - sy * 0.5) * ch };
+  };
+
+  for (let i = 0; i < state.targets.length; i++) {
+    const t = state.targets[i];
+    const w = t._w || refToWorld(state.R0, t.dir);
+    const p = project(w);
+    const active = i === state.activeTarget;
+
+    if (t.done) {
+      if (!p || Math.abs(p.sx) > 1.15 || Math.abs(p.sy) > 1.15) continue;
+      g.beginPath(); g.arc(p.x, p.y, 5 * dpr, 0, 7); g.fillStyle = 'rgba(51,210,155,0.55)'; g.fill();
+      continue;
+    }
+
+    if (!p || Math.abs(p.sx) > 1.15 || Math.abs(p.sy) > 1.15) {
+      if (active) drawEdgeArrow(g, cw, ch, dpr, p, w);
+      continue;
+    }
+
+    if (active) {
+      g.beginPath(); g.arc(p.x, p.y, 15 * dpr, 0, 7);
+      g.lineWidth = 3 * dpr; g.strokeStyle = 'rgba(255,255,255,0.85)'; g.stroke();
+      if (t.progress > 0) {
+        g.beginPath();
+        g.arc(p.x, p.y, 15 * dpr, -Math.PI / 2, -Math.PI / 2 + t.progress * 2 * Math.PI);
+        g.lineWidth = 5 * dpr; g.strokeStyle = '#33d29b'; g.lineCap = 'round'; g.stroke();
+        g.lineCap = 'butt';
+      }
+      g.beginPath(); g.arc(p.x, p.y, 3 * dpr, 0, 7); g.fillStyle = '#fff'; g.fill();
+    } else {
+      g.beginPath(); g.arc(p.x, p.y, 6 * dpr, 0, 7);
+      g.fillStyle = 'rgba(255,255,255,0.28)'; g.fill();
+      g.lineWidth = 1.5 * dpr; g.strokeStyle = 'rgba(255,255,255,0.5)'; g.stroke();
+    }
+  }
+}
+
+function drawEdgeArrow(g, cw, ch, dpr, p, w) {
+  // direction toward the (off-screen) active target, from screen centre
+  let ang;
+  if (p) ang = Math.atan2(p.y - ch / 2, p.x - cw / 2);
+  else {
+    const c = worldToCam(state.R, w);
+    ang = Math.atan2(-c[1], c[0]); // fall back to raw bearing; flip Y for screen
+  }
+  const rad = Math.min(cw, ch) * 0.4;
+  const x = cw / 2 + Math.cos(ang) * rad, y = ch / 2 + Math.sin(ang) * rad;
+  g.save();
+  g.translate(x, y); g.rotate(ang);
+  g.beginPath();
+  g.moveTo(10 * dpr, 0); g.lineTo(-8 * dpr, 7 * dpr); g.lineTo(-8 * dpr, -7 * dpr); g.closePath();
+  g.fillStyle = 'rgba(255,255,255,0.9)'; g.fill();
+  g.restore();
 }
 
 function loop(now = performance.now()) {
@@ -331,9 +416,9 @@ function loop(now = performance.now()) {
     $('sim-banner').hidden = false;
   }
 
-  maybeAutoCapture(now);
+  updateGuidance(now);
+  drawGuide();
 
-  if (now - state.lastClassPass > 90) { refreshGridClasses(); state.lastClassPass = now; }
   if (now - state.lastPreview > 60) { state.engine.presentFlat(); state.lastPreview = now; }
 }
 
@@ -376,7 +461,6 @@ async function start() {
   state.engine.clear();
   glCanvas.className = 'gl-mini';
   $('screen-capture').appendChild(glCanvas);
-  buildGrid();
   resetCoverage();
 
   state._simCheckAt = performance.now() + 1400;
@@ -595,6 +679,7 @@ function wire() {
   $('fov').addEventListener('input', (e) => {
     state.hfovDeg = +e.target.value;
     $('fov-val').textContent = state.hfovDeg + '°';
+    if (state.targets.length) buildTargets(); // re-space the dot lattice to the new FOV
   });
   $('autocap').addEventListener('change', (e) => (state.autoCap = e.target.checked));
   $('vidrot').addEventListener('change', (e) => (state.vidRot = +e.target.value));
@@ -675,6 +760,10 @@ function boot() {
 
   if ('serviceWorker' in navigator && secure) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+
+  if (location.search.includes('debug')) {
+    window.__ps = { state, buildTargets, updateGuidance, drawGuide, showScreen, loop };
   }
 }
 

@@ -91,26 +91,7 @@ h1 { font-size: 30px; margin: 0 0 8px; letter-spacing: -0.02em; }
 }
 
 .hud { position: absolute; inset: 0; pointer-events: none; }
-.grid {
-  position: absolute; inset: 6% 4%;
-  display: grid;
-  gap: 2px;
-  opacity: 0.9;
-}
-.cell {
-  border-radius: 3px;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.10);
-  transition: background-color 0.25s, border-color 0.25s;
-}
-.cell.covered {
-  background: rgba(51, 210, 155, 0.42);
-  border-color: rgba(51, 210, 155, 0.8);
-}
-.cell.current {
-  border-color: #fff;
-  box-shadow: 0 0 0 1px #fff inset;
-}
+.guide { position: absolute; inset: 0; width: 100%; height: 100%; }
 .reticle {
   position: absolute; left: 50%; top: 50%;
   width: 54px; height: 54px;

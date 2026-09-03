@@ -1,7 +1,7 @@
 // Minimal app-shell service worker: offline-capable, cache-first for static assets.
 // Keep this version in sync with APP_VERSION in js/app.js — bumping it evicts
 // the old cache so a redeploy actually ships.
-const CACHE = 'photosphere-0.4.2';
+const CACHE = 'photosphere-0.4.3';
 const ASSETS = [
   './',
   './index.html',

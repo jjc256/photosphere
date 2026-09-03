@@ -44,11 +44,13 @@ Alternatives that avoid the cert warning: run any static host
 ## How to shoot a good sphere
 
 1. Tap **Start capture** and allow **Motion & Orientation** + **Camera**.
-2. Stand still. Pivot the phone around *your own body*, keeping it close to you —
-   don't walk around; parallax is what breaks hand-held stitching.
-3. Move slowly and pause. Frames are grabbed automatically when the phone is
-   steady and has panned far enough (or tap the shutter yourself).
-4. Watch the grid fill in green. Sweep up and down too. Aim for ~90%+.
+2. A lattice of **dots** appears around you. Line the centre crosshair up with a
+   dot and **hold still** — a ring fills and the frame is grabbed automatically
+   (blurred grabs are rejected). The dot turns green; move to the next one.
+3. Pivot the phone around *your own body*, keeping it close to you — don't walk;
+   parallax is what breaks hand-held stitching. Keep textured things in frame.
+4. Work outward through the dots (the counter shows how many are done). You
+   don't have to get them all — tap **Done** once you've covered what you want.
 5. Tap **Done**. The frames are stitched (a few seconds — "Stitching · …"),
    then you land in the review viewer: drag to look around, pinch to zoom,
    toggle the flat equirectangular view.

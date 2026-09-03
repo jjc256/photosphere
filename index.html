@@ -33,11 +33,11 @@
     <details class="tips">
       <summary>Capture tips</summary>
       <ul>
+        <li>Line the centre crosshair up with a <strong>dot</strong>, then hold still — the ring fills and the shot is grabbed automatically.</li>
         <li>Pivot the phone around <em>your body's</em> axis — keep it close to you, don't walk.</li>
-        <li>Move slowly and pause; frames are grabbed when the phone is steady.</li>
-        <li>Overlap each frame with the last. Watch the grid fill in.</li>
-        <li>Best results outdoors or in large rooms with distant walls.</li>
-        <li>Set the field-of-view slider to match your lens if edges don't line up.</li>
+        <li>Work through the dots; tap <strong>Done</strong> whenever you've covered enough.</li>
+        <li>Keep textured things in view (edges, objects) — blank sky or walls won't stitch.</li>
+        <li>Best results outdoors or in large rooms; set the FOV slider to match your lens.</li>
       </ul>
     </details>
     <p class="version" id="app-version"></p>
@@ -49,7 +49,7 @@
   <video id="cam" playsinline muted autoplay></video>
 
   <div id="hud" class="hud" aria-hidden="true">
-    <div id="grid" class="grid"></div>
+    <canvas id="guide" class="guide"></canvas>
     <div id="reticle" class="reticle"></div>
   </div>
 
