@@ -36,7 +36,7 @@ function makeMat(cv, f) {
 }
 
 function openCVBackend(cv) {
-  const hasSift = typeof cv.SIFT_create === 'function';
+  const hasSift = typeof cv.SIFT?.create === 'function' || typeof cv.SIFT_create === 'function';
   const kind = hasSift ? 'OpenCV SIFT' : 'OpenCV ORB';
   return {
     kind,
@@ -45,7 +45,9 @@ function openCVBackend(cv) {
       const kps = new cv.KeyPointVector();
       const desc = new cv.Mat();
       const mask = new cv.Mat();
-      const detector = hasSift ? cv.SIFT_create(900) : new cv.ORB(1200, 1.2, 8);
+      const detector = hasSift
+        ? (cv.SIFT?.create ? cv.SIFT.create(900) : cv.SIFT_create(900))
+        : new cv.ORB(1200, 1.2, 8);
       try {
         detector.detectAndCompute(src, mask, kps, desc);
         const points = [];
