@@ -7,15 +7,16 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.5.3';
+const APP_VERSION = '0.5.4';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 // ---- captured-frame budget --------------------------------------------------
-const MAX_SHOTS = 32;   // memory-bounded; ImageData is kept for the final blend
-const CAP_LONG = 1024;  // long side kept for compositing
+const MAX_SHOTS = 44;   // memory-bounded; ImageData is kept for the final blend
+const CAP_LONG = 800;   // long side kept for compositing
 const GRAY_LONG = 512;  // long side used for feature detection
+const CAP_STEP = 18 * Math.PI / 180; // grab a frame every ~18° of pan (overlap guarantee)
 
 const state = {
   stream: null,
@@ -28,7 +29,7 @@ const state = {
   headingDeg: null,
   geo: null,          // { lat, lon, alt, acc } — embedded only in the downloaded file
   geoWatch: null,
-  hfovDeg: 55,
+  hfovDeg: 50,
   vidRot: 0,
   autoCap: true,
   shots: [],          // { imgData, w, h, gray, gw, gh, sharp, quat, hfovDeg }
@@ -241,18 +242,13 @@ function doCapture(manual) {
 // A lattice of dots on the sphere, spaced ~60% of the field of view so
 // neighbouring shots overlap enough to stitch. Sized to the current FOV.
 function buildTargets() {
-  const fov = state.hfovDeg || 55;
-  // space dots ~80% of the FOV apart -> ~20% overlap between neighbours
-  const eqN = clamp(Math.round(360 / (fov * 0.82)), 5, 10);
-  const midP = fov * 0.55, highP = Math.min(64, fov * 1.15);
+  // Sparse sweep guide only — 3 rings, no pole caps. Coverage comes from the
+  // ~18° displacement grabs as you sweep between dots; the true poles are
+  // filled in software.
   const rings = [
-    { p: 0, n: eqN },
-    { p: midP, n: Math.max(5, Math.round(eqN * 0.8)) },
-    { p: -midP, n: Math.max(5, Math.round(eqN * 0.8)) },
-    { p: highP, n: Math.max(3, Math.round(eqN * 0.42)) },
-    { p: -highP, n: Math.max(3, Math.round(eqN * 0.42)) },
-    { p: 82, n: 3 },   // near-zenith cap (the last ~8° is filled in software)
-    { p: -82, n: 3 },  // near-nadir cap
+    { p: 0, n: 8 },
+    { p: 42, n: 6 },
+    { p: -42, n: 6 },
   ];
   const T = [];
   rings.forEach((r, ri) => {
@@ -327,20 +323,38 @@ function updateGuidance(now) {
   }
   state.activeTarget = act;
 
-  const CONE = 8 * DEG, FILL = 0.7;
+  const CONE = 10 * DEG, FILL = 0.6;
+  const markNearbyDot = () => {
+    if (act >= 0 && state.targets[act]._ang < 16 * DEG) {
+      state.targets[act].done = true; state.targets[act].progress = 1;
+    }
+  };
+
+  // Dots are a sweep guide; frames are actually grabbed whenever the phone has
+  // moved ~18° from the last grab and is steady — that keeps neighbours
+  // overlapping regardless of the real lens FOV (the failure mode was 45°
+  // dot spacing on a ~46° camera => near-zero overlap => nothing matched).
+  const movedSince = state.lastCapQuat ? quatAngle(state.quat, state.lastCapQuat) : Infinity;
+  let grabbed = false;
+  if (steady && state.shots.length < MAX_SHOTS &&
+      (movedSince > CAP_STEP || (act >= 0 && state.targets[act]._ang < CONE && state.shots.length === 0))) {
+    if (doCapture(false)) { grabbed = true; markNearbyDot(); }
+  }
+
   for (let i = 0; i < state.targets.length; i++) {
     const t = state.targets[i];
     if (t.done) continue;
     const on = i === act && t._ang < CONE && steady;
     t.progress = clamp(t.progress + (on ? dt / FILL : -dt / 0.3), 0, 1);
-    if (t.progress >= 1 && on && doCapture(false)) { t.done = true; t.progress = 1; }
+    if (t.progress >= 1 && on && !grabbed && doCapture(false)) { t.done = true; t.progress = 1; grabbed = true; }
   }
 
   const done = state.targets.filter((t) => t.done).length;
   $('coverage').textContent = `${done}/${state.targets.length}`;
-  if (done === state.targets.length) hint.textContent = 'All dots captured — tap Done';
+  if (state.shots.length >= MAX_SHOTS) hint.textContent = 'Plenty of frames — tap Done';
+  else if (done === state.targets.length) hint.textContent = 'All dots done — tap Done';
   else if (act >= 0 && state.targets[act]._ang < CONE) hint.textContent = steady ? 'Hold…' : 'Hold still';
-  else hint.textContent = 'Aim at the nearest dot';
+  else hint.textContent = 'Sweep toward the next dot';
 }
 
 function drawGuide() {
