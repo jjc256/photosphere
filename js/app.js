@@ -7,7 +7,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.5.2';
+const APP_VERSION = '0.5.3';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -513,6 +513,7 @@ async function toReview() {
   diag.textContent = `v${APP_VERSION}\n` + (result.log || []).join('\n');
   diag.classList.toggle('err', partial);
   diag.hidden = !partial;   // shows whenever anything went wrong; tap the count chip to toggle
+  $('btn-debug').hidden = !partial;
 
   try {
     if (result.ok) {
@@ -579,6 +580,37 @@ function stopReviewLoop() { cancelAnimationFrame(state._rraf); }
 function timestamp() {
   const d = new Date(), p = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+// Bundle the raw captured luma frames + poses so a failed stitch can be
+// replayed and debugged offline (node debugreplay.mjs <file>).
+function saveDebugData() {
+  const b64 = (u8) => {
+    let s = '';
+    for (let i = 0; i < u8.length; i += 0x8000) {
+      s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+    }
+    return btoa(s);
+  };
+  const payload = {
+    version: APP_VERSION,
+    ua: navigator.userAgent,
+    hfovDeg: state.hfovDeg,
+    videoWH: [video.videoWidth, video.videoHeight],
+    stitchLog: state._stitchLog || [],
+    shots: state.shots.map((s) => ({
+      gw: s.gw, gh: s.gh, w: s.w, h: s.h, quat: s.quat, hfovDeg: s.hfovDeg,
+      sharp: s.sharp, grayB64: b64(s.gray),
+    })),
+  };
+  const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `photosphere-debug-${timestamp()}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 6000);
+  toast('Saved — send that file over');
 }
 
 async function download() {
@@ -718,6 +750,7 @@ function wire() {
 
   // review: back / flat toggle / download / share
   $('btn-back').addEventListener('click', () => { stopReviewLoop(); state._lastFile = null; resume(); });
+  $('btn-debug').addEventListener('click', saveDebugData);
   $('review-cov').addEventListener('click', () => { const d = $('stitch-diag'); d.hidden = !d.hidden; });
   $('btn-viewmode').addEventListener('click', () => {
     state.viewFlat = !state.viewFlat;

@@ -221,6 +221,10 @@ canvas.gl-mini {
   max-height: 30vh; overflow: auto;
 }
 .stitch-diag.err { color: #ffb3b3; border-color: rgba(255, 120, 120, 0.5); }
+.debug-chip {
+  position: absolute; left: 8px; bottom: calc(112px + var(--safe-b));
+  font-size: 11px; opacity: 0.9;
+}
 
 .review-bottom { flex-direction: column; gap: 10px; }
 .review-bottom .btn { width: min(420px, 100%); }
