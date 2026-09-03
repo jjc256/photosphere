@@ -7,6 +7,8 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir, inFrustum,
 } from './orientation.js';
 
+const APP_VERSION = '0.4.1';
+
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
@@ -634,6 +636,8 @@ function wire() {
 // ---- boot --------------------------------------------------------------------
 function boot() {
   wire();
+  $('app-version').textContent = 'v' + APP_VERSION;
+  console.log('PhotoSphere v' + APP_VERSION);
 
   const secure = location.protocol === 'https:' ||
     ['localhost', '127.0.0.1'].includes(location.hostname);
