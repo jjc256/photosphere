@@ -130,7 +130,11 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
       if (hSeed.every((x) => isFinite(x)) && off < 0.6) seed = hSeed;
     } catch { /* keep gyro seed */ }
     const { Rrel, rms, inl } = refineRelRot(seed, v.mc, focal);
-    if (rms < 4 && inl >= 10) { edges.push({ i: v.i, j: v.j, Rrel, w: Math.min(inl, 120) }); UF.union(v.i, v.j); }
+    // accept a pair if it aligns tightly, OR loosely but with lots of inliers
+    // (wide-baseline / mild parallax pairs still anchor the graph)
+    if (inl >= 10 && (rms < 4 || (rms < 6.5 && inl >= 25))) {
+      edges.push({ i: v.i, j: v.j, Rrel, w: Math.min(inl, 120) }); UF.union(v.i, v.j);
+    }
     v.rms = rms;
     await tick();
   }

@@ -7,7 +7,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.5.4';
+const APP_VERSION = '0.5.5';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -16,7 +16,7 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const MAX_SHOTS = 44;   // memory-bounded; ImageData is kept for the final blend
 const CAP_LONG = 800;   // long side kept for compositing
 const GRAY_LONG = 512;  // long side used for feature detection
-const CAP_STEP = 18 * Math.PI / 180; // grab a frame every ~18° of pan (overlap guarantee)
+const CAP_STEP = 14 * Math.PI / 180; // grab a frame every ~14° of pan (overlap guarantee)
 
 const state = {
   stream: null,
@@ -330,14 +330,14 @@ function updateGuidance(now) {
     }
   };
 
-  // Dots are a sweep guide; frames are actually grabbed whenever the phone has
-  // moved ~18° from the last grab and is steady — that keeps neighbours
-  // overlapping regardless of the real lens FOV (the failure mode was 45°
-  // dot spacing on a ~46° camera => near-zero overlap => nothing matched).
+  // Frames are grabbed continuously as you sweep — every CAP_STEP of pan
+  // while the phone is moving slowly (not stopped, not whipping). Requiring a
+  // full stop meant a continuous sweep never triggered a grab, so neighbours
+  // ended up 45° apart on a ~42° lens and nothing overlapped.
   const movedSince = state.lastCapQuat ? quatAngle(state.quat, state.lastCapQuat) : Infinity;
+  const sweeping = state.speed < 0.45;         // < ~26°/s
   let grabbed = false;
-  if (steady && state.shots.length < MAX_SHOTS &&
-      (movedSince > CAP_STEP || (act >= 0 && state.targets[act]._ang < CONE && state.shots.length === 0))) {
+  if (sweeping && state.shots.length < MAX_SHOTS && movedSince > CAP_STEP) {
     if (doCapture(false)) { grabbed = true; markNearbyDot(); }
   }
 
@@ -353,8 +353,8 @@ function updateGuidance(now) {
   $('coverage').textContent = `${done}/${state.targets.length}`;
   if (state.shots.length >= MAX_SHOTS) hint.textContent = 'Plenty of frames — tap Done';
   else if (done === state.targets.length) hint.textContent = 'All dots done — tap Done';
-  else if (act >= 0 && state.targets[act]._ang < CONE) hint.textContent = steady ? 'Hold…' : 'Hold still';
-  else hint.textContent = 'Sweep toward the next dot';
+  else if (state.speed >= 0.45) hint.textContent = 'Slow down a little';
+  else hint.textContent = `Sweep toward the next dot · ${state.shots.length}`;
 }
 
 function drawGuide() {
@@ -536,14 +536,15 @@ async function toReview() {
       const s0 = state.shots[0];
       const tanX = Math.tan((state.hfovDeg * DEG) / 2) / result.focalScale;
       const tanY = tanX * (s0.h / s0.w);
-      // composite only the aligned frames (a mis-posed loose frame is worse
-      // than a small gap); fall back to all if too few connected
+      // Composite the aligned frames at full seam priority; unaligned frames
+      // are passed too but marked `weak` so they only fill gaps the aligned
+      // ones don't cover (better than a black hole).
+      const nConn = result.connected.filter(Boolean).length;
       const parts = state.shots.map((s, k) => ({
-        img: s.imgData, R: result.rotations[k], gain: result.gains[k], conn: result.connected[k],
+        img: s.imgData, R: result.rotations[k], gain: result.gains[k],
+        weak: nConn >= 3 && !result.connected[k],
       }));
-      const conn = parts.filter((p) => p.conn);
-      state.engine.compositeStitched(conn.length >= 3 ? conn : parts, tanX, tanY);
-      const nConn = conn.length;
+      state.engine.compositeStitched(parts, tanX, tanY);
       if (nConn < state.shots.length) toast(`Aligned ${nConn} of ${state.shots.length} frames`);
     } else {
       state.engine.bake(); // gyro-only fallback (from the live splat accumulation)

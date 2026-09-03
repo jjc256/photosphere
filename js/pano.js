@@ -124,10 +124,11 @@ bool warp(out vec3 rgb, out float edge) {
 const LABEL_FRAG = WARP_HEAD + `
 out vec4 frag;
 uniform float uIndex;
+uniform float uPriority;               // 1 for aligned frames, low for gyro-only
 void main() {
   vec3 rgb; float edge;
   if (!warp(rgb, edge)) discard;
-  gl_FragDepth = 1.0 - edge * 0.999;    // higher border distance -> smaller depth -> wins
+  gl_FragDepth = 1.0 - edge * uPriority * 0.999; // higher (border dist * priority) wins
   frag = vec4((uIndex + 1.0) / 255.0, edge, 0.0, 1.0);
 }`;
 
@@ -601,6 +602,7 @@ export class PanoEngine {
       this._uploadFrame(fr.img);
       this._warpUniforms(this.pLabel, rots[k], tanX, tanY, fr.gain || 1);
       gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uIndex'), k);
+      gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uPriority'), fr.weak ? 0.18 : 1.0);
       this._quad();
     });
     gl.disable(gl.DEPTH_TEST);
