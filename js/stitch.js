@@ -32,8 +32,13 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   const gyroR = shots.map((s) => qToR(s.quat));
   const hfov = (shots[0].hfovDeg || 55) * DEG;
   const w = shots[0].w, h = shots[0].h;
-  let cx = w / 2, cy = h / 2;
-  const focal0 = (w / 2) / Math.tan(hfov / 2);
+  // Panorama stores feature/film coordinates centred and divided by the
+  // longer image edge.  Its camera, PTLens coefficients and RANSAC thresholds
+  // all live in that unit system, so retain it through bundle adjustment.
+  const coordinateScale = Math.max(w, h);
+  const outCx = w / 2, outCy = h / 2;
+  let cx = 0, cy = 0;
+  const focal0 = ((w / 2) / Math.tan(hfov / 2)) / coordinateScale;
   const bail = () => ({ rotations: gyroR, focalScale: 1, k1: 0, k2: 0, k3: 0, gains: shots.map(() => 1), connected: shots.map(() => true), ok: false, log });
 
   if (N < 2) { log.push('need >= 2 frames'); return bail(); }
@@ -82,17 +87,18 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     if (raw.length >= 10) {
       const pa = raw.map(([a]) => [feats[i].kps[a].x, feats[i].kps[a].y]);
       const pb = raw.map(([, b]) => [feats[j].kps[b].x, feats[j].kps[b].y]);
-      const ca = pa.map((p) => [p[0] - cx, p[1] - cy]);
-      const cb = pb.map((p) => [p[0] - cx, p[1] - cy]);
+      const ca = pa.map((p) => [(p[0] - outCx) / coordinateScale, (p[1] - outCy) / coordinateScale]);
+      const cb = pb.map((p) => [(p[0] - outCx) / coordinateScale, (p[1] - outCy) / coordinateScale]);
       // Direct calibrated-ray RANSAC decides whether the images overlap.
       const gyroSeed = matMul3(matT3(gyroR[j]), gyroR[i]);
-      const geometric = ransacGeneralizedRotation(ca.map((p, k) => [p[0], p[1], cb[k][0], cb[k][1]]), focal0, gyroSeed);
+      const geometric = ransacGeneralizedRotation(ca.map((p, k) => [p[0], p[1], cb[k][0], cb[k][1]]), focal0, gyroSeed,
+        { thresh: 4 / coordinateScale });
       const inliers = geometric.inliers;
       bestInl = Math.max(bestInl, inliers.length);
       if (inliers.length >= 12) {
         // Keep a homography only as a weak focal vote; it no longer controls
         // pair acceptance or the relative-rotation seed.
-        const { H } = ransacHomography(ca, cb, { iters: 180, thresh: 4.5 });
+        const { H } = ransacHomography(ca, cb, { iters: 180, thresh: 4.5 / coordinateScale });
         const step = Math.max(1, Math.floor(inliers.length / 70));
         const mc = [];
         for (let k = 0; k < inliers.length; k += step) {
@@ -117,7 +123,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   // 4. focal length: median of the per-homography estimates
   let focal = focals.length >= 3 ? median(focals) : focal0;
   focal = clamp(focal, 0.5 * focal0, 2.0 * focal0);
-  log.push(`focal ${focal.toFixed(1)}px (init ${focal0.toFixed(1)}, ${focals.length} votes)`);
+  log.push(`focal ${(focal * coordinateScale).toFixed(1)}px (init ${(focal0 * coordinateScale).toFixed(1)}, ${focals.length} votes)`);
 
   // 4b. calibrate the lens: solve radial distortion k1 (and polish the focal)
   // by minimising total pairwise reprojection error. A phone lens is not a
@@ -139,7 +145,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     let sse = 0, n = 0;
     for (const v of calibSet) {
       const r = refineRelRot(seedFor(v, fl), v.mc, fl, { k1: kk, k2: kk2, k3: kk3, linearity: ll, iters: 8 });
-      if (r.inl >= 10 && r.rms < 20) { sse += r.rms * r.rms * r.inl; n += r.inl; }
+      if (r.inl >= 10 && r.rms < 20 / coordinateScale) { sse += r.rms * r.rms * r.inl; n += r.inl; }
     }
     return n ? Math.sqrt(sse / n) : 1e9;
   };
@@ -185,7 +191,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
       }
       await tick();
     }
-    log.push(`lens: L ${linearity.toFixed(3)}, a ${k1.toFixed(3)}, b ${k2.toFixed(3)}, c ${k3.toFixed(3)}, focal ${focal.toFixed(1)} ` +
+    log.push(`lens: L ${linearity.toFixed(3)}, a ${k1.toFixed(5)}, b ${k2.toFixed(5)}, c ${k3.toFixed(5)}, focal ${(focal * coordinateScale).toFixed(1)} ` +
       `(${(focal / focal0).toFixed(3)}x), pair rms ${best.toFixed(2)}px`);
   }
 
@@ -198,7 +204,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     const { Rrel, rms, inl } = refineRelRot(seedFor(v, focal), v.mc, focal, { k1, k2, k3, linearity });
     // accept a pair if it aligns tightly, OR loosely but with lots of inliers
     // (wide-baseline / mild parallax pairs still anchor the graph)
-    if (inl >= 10 && (rms < 4 || (rms < 6.5 && inl >= 25))) {
+    if (inl >= 10 && (rms < 4 / coordinateScale || (rms < 6.5 / coordinateScale && inl >= 25))) {
       edges.push({ i: v.i, j: v.j, Rrel, w: Math.min(inl, 120), mc: v.mc }); UF.union(v.i, v.j);
     }
     v.rms = rms;
@@ -233,22 +239,23 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     const drift = Math.hypot(...logSO3(matMul3(avg[k], matT3(g))));
     return drift < 0.5 && avg[k].every((v) => isFinite(v)) ? avg[k] : g;
   });
-  let cameras = shots.map(() => ({ focalScale: 1, cx, cy }));
+  let cameras = shots.map(() => ({ focalScale: 1, cx: outCx, cy: outCy }));
 
   // 7b. One global reprojection solve. Isolated nodes remain anchored by their
   // IMU priors while every verified edge shares the same lens calibration.
   const allPairs = edges.map((e) => ({
-    i: e.i, j: e.j, m: e.mc.map(([xi, yi, xj, yj]) => [xi + cx, yi + cy, xj + cx, yj + cy]),
+    i: e.i, j: e.j, m: e.mc,
   }));
   if (allPairs.length) {
     try {
       const ba = await globalBundleAdjust(shots.map(() => ({ w, h })), rotations, allPairs, {
-        focal0: focal, cx, cy, k1, k2, k3, linearity, optimizeFocal: true, optimizeLens: true, optimizePerFrame: true,
-        priorW: 0.08, huber: 5, iters: N > 24 ? 4 : 10,
+        focal0: focal, cx, cy, k1, k2, k3, linearity, optimizeFocal: false, optimizeLens: true, optimizeDistortion: false,
+        optimizePerFrame: true, optimizePerFrameCenter: false,
+        priorW: 0.08, huber: 5 / coordinateScale, iters: N > 24 ? 4 : 10,
       });
       if (ba.R.every((R) => R.every((v) => isFinite(v))) && isFinite(ba.focal)) {
-        rotations = ba.R; focal = ba.focal; k1 = ba.k1; k2 = ba.k2; k3 = ba.k3; linearity = ba.linearity; cx = ba.cx; cy = ba.cy; cameras = ba.cameras;
-        log.push(`global BA: focal ${focal.toFixed(1)}, L ${linearity.toFixed(3)}, a ${k1.toFixed(3)}, b ${k2.toFixed(3)}, c ${k3.toFixed(3)}`);
+        rotations = ba.R; focal = ba.focal; k1 = ba.k1; k2 = ba.k2; k3 = ba.k3; linearity = ba.linearity;
+        log.push(`global BA: focal ${(focal * coordinateScale).toFixed(1)}, L ${linearity.toFixed(3)}, a ${k1.toFixed(5)}, b ${k2.toFixed(5)}, c ${k3.toFixed(5)}`);
       }
     } catch { /* retain rotation average if the numeric solve is ill-conditioned */ }
   }
@@ -270,7 +277,10 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   // Small isolated components are locally aligned but not tied to the broader
   // panorama. Render them as weak evidence so a tiny island cannot overwrite
   // a larger, coherent view at a seam.
-  return { rotations, focalScale: focal / focal0, k1, k2, k3, linearity, cx, cy, cameras, gains, connected, reliable, ok: true, log };
+  // The WebGL warp works in angular radius. Convert Panorama's film-radius
+  // PTLens coefficients at the solved focal length for that renderer only.
+  return { rotations, focalScale: focal / focal0, k1: k1 * focal, k2: k2 * focal * focal, k3: k3 * focal * focal * focal,
+    linearity, cx: outCx, cy: outCy, cameras, gains, connected, reliable, ok: true, log };
 }
 
 class UnionFind {

@@ -289,21 +289,25 @@ export function undistortPt(x, y, a = 0, b = 0, c = 0) {
   return [x * r / rd, y * r / rd];
 }
 
-function rayFromFilm(x, y, k1, k2, k3, linearity) {
+// Panorama applies PTLens in film coordinates, *after* multiplying the
+// generalized ray radius by focal length.  Keeping that order matters whenever
+// focal is calibrated: applying the polynomial to x/f (the former browser
+// implementation) describes a different camera.
+function rayFromFilm(x, y, focal, k1, k2, k3, linearity) {
   const u = undistortPt(x, y, k1, k2, k3);
   const r = Math.hypot(u[0], u[1]);
   if (r < 1e-12) return [0, 0, -1];
-  const theta = radiusToTheta(r, linearity);
+  const theta = radiusToTheta(r / focal, linearity);
   const s = Math.sin(theta) / r;
   return [u[0] * s, u[1] * s, -Math.cos(theta)];
 }
 
-function filmFromRay(d, k1, k2, k3, linearity) {
+function filmFromRay(d, focal, k1, k2, k3, linearity) {
   const n = Math.hypot(d[0], d[1], d[2]) || 1;
   const theta = Math.acos(Math.max(-1, Math.min(1, -d[2] / n)));
   const xy = Math.hypot(d[0], d[1]);
   if (xy < 1e-12) return [0, 0];
-  const r = thetaToRadius(theta, linearity);
+  const r = thetaToRadius(theta, linearity) * focal;
   return distortPt(d[0] * r / xy, d[1] * r / xy, k1, k2, k3);
 }
 
@@ -318,16 +322,20 @@ export function refineRelRot(Rrel0, m0, f, { iters = 20, k1 = 0, k2 = 0, k3 = 0,
   const rays = new Map();
   const ray = (m) => {
     let r = rays.get(m);
-    if (!r) { r = rayFromFilm(m[0] / f, m[1] / f, k1, k2, k3, linearity); rays.set(m, r); }
+    if (!r) { r = rayFromFilm(m[0], m[1], f, k1, k2, k3, linearity); rays.set(m, r); }
     return r;
   };
   const perErr = (R, m) => {
     const e = new Float64Array(m.length);
+    const Ri = matT3(R);
     for (let k = 0; k < m.length; k++) {
       const d = matVec3(R, ray(m[k]));
       const z = Math.min(d[2], -0.05);
-      const p = filmFromRay([d[0], d[1], z], k1, k2, k3, linearity);
-      e[k] = Math.hypot(f * p[0] - m[k][2], f * p[1] - m[k][3]);
+      const p = filmFromRay([d[0], d[1], z], f, k1, k2, k3, linearity);
+      const back = matVec3(Ri, ray([m[k][2], m[k][3]]));
+      const bz = Math.min(back[2], -0.05);
+      const q = filmFromRay([back[0], back[1], bz], f, k1, k2, k3, linearity);
+      e[k] = Math.hypot(p[0] - m[k][2], p[1] - m[k][3], q[0] - m[k][0], q[1] - m[k][1]);
     }
     return e;
   };
@@ -336,13 +344,19 @@ export function refineRelRot(Rrel0, m0, f, { iters = 20, k1 = 0, k2 = 0, k3 = 0,
   const lm = (Rin, m) => {
     let R = Rin.slice();
     const resid = (Rr) => {
-      const out = new Float64Array(m.length * 2);
+      const out = new Float64Array(m.length * 4);
+      const Ri = matT3(Rr);
       for (let k = 0; k < m.length; k++) {
         const d = matVec3(Rr, ray(m[k]));
         const z = Math.min(d[2], -0.05);
-        const p = filmFromRay([d[0], d[1], z], k1, k2, k3, linearity);
-        out[k * 2] = f * p[0] - m[k][2];
-        out[k * 2 + 1] = f * p[1] - m[k][3];
+        const p = filmFromRay([d[0], d[1], z], f, k1, k2, k3, linearity);
+        const back = matVec3(Ri, ray([m[k][2], m[k][3]]));
+        const bz = Math.min(back[2], -0.05);
+        const q = filmFromRay([back[0], back[1], bz], f, k1, k2, k3, linearity);
+        out[k * 4] = p[0] - m[k][2];
+        out[k * 4 + 1] = p[1] - m[k][3];
+        out[k * 4 + 2] = q[0] - m[k][0];
+        out[k * 4 + 3] = q[1] - m[k][1];
       }
       return out;
     };
@@ -401,9 +415,12 @@ export function ransacGeneralizedRotation(matches, f, seedR, {
   let state = seed >>> 0;
   const rnd = () => { state = (state * 1664525 + 1013904223) >>> 0; return state; };
   const errors = (R) => matches.map((m) => {
-    const d = matVec3(R, rayFromFilm(m[0] / f, m[1] / f, k1, k2, k3, linearity));
-    const p = filmFromRay(d, k1, k2, k3, linearity);
-    return Math.hypot(f * p[0] - m[2], f * p[1] - m[3]);
+    const d = matVec3(R, rayFromFilm(m[0], m[1], f, k1, k2, k3, linearity));
+    const p = filmFromRay(d, f, k1, k2, k3, linearity);
+    const Ri = matT3(R);
+    const back = matVec3(Ri, rayFromFilm(m[2], m[3], f, k1, k2, k3, linearity));
+    const q = filmFromRay(back, f, k1, k2, k3, linearity);
+    return Math.hypot(p[0] - m[2], p[1] - m[3], q[0] - m[0], q[1] - m[1]);
   });
   let best = { Rrel: seedR, inliers: [] };
   for (let it = 0; it < iters; it++) {
@@ -420,7 +437,10 @@ export function ransacGeneralizedRotation(matches, f, seedR, {
     { k1, k2, k3, linearity, iters: 16 });
   const finalErr = errors(refined.Rrel);
   const inliers = [];
-  for (const [i, e] of finalErr.entries()) if (e < Math.max(2.2, thresh * 0.72)) inliers.push(i);
+  // `thresh` is expressed in the caller's film-coordinate unit. Panorama
+  // normalises points by the longer image edge, so a pixel-sized hard floor
+  // here would silently admit every outlier after the final RANSAC pass.
+  for (const [i, e] of finalErr.entries()) if (e < thresh * 0.72) inliers.push(i);
   return { Rrel: refined.Rrel, inliers };
 }
 
@@ -470,7 +490,7 @@ function weightedQuatAvg(list) {
 // Returns { R: [mat3], focal, cost }
 export function bundleAdjust(frames, gyroR, pairs, {
   focal0, cx, cy, k1 = 0, k2 = 0, k3 = 0, linearity = 1, optimizeFocal = true,
-  optimizeLens = false, optimizePerFrame = false,
+  optimizeLens = false, optimizeDistortion = false, optimizePerFrame = false, optimizePerFrameCenter = false,
   priorW = 0.05, huber = 12, iters = 40, anchor = 0,
   normalSolver = null,
 } = {}) {
@@ -486,9 +506,17 @@ export function bundleAdjust(frames, gyroR, pairs, {
   const active = [];
   for (let k = 0; k < N; k++) if (k !== anchor) active.push(k * 3, k * 3 + 1, k * 3 + 2);
   if (optimizeFocal) active.push(FI);
-  if (optimizeLens) active.push(LI, K1I, K2I, K3I, CXI, CYI);
+  // Panorama's final bundle-adjustment pass unlocks generalized linearity and
+  // focal length, but leaves PTLens fixed.  Unlocking both from one sparse
+  // graph makes them trade off against each other and is what caused the
+  // unstable lens jump in the browser replay.
+  if (optimizeLens) active.push(LI);
+  if (optimizeDistortion) active.push(K1I, K2I, K3I);
   const used = new Set(pairs.flatMap((p) => [p.i, p.j]));
-  if (optimizePerFrame) for (let k = 0; k < N; k++) if (used.has(k)) active.push(PFI + k, PCXI + k, PCYI + k);
+  if (optimizePerFrame) for (let k = 0; k < N; k++) if (used.has(k)) {
+    active.push(PFI + k);
+    if (optimizePerFrameCenter) active.push(PCXI + k, PCYI + k);
+  }
   const P = active.length;
 
   const curR = (t) => {
@@ -509,12 +537,12 @@ export function bundleAdjust(frames, gyroR, pairs, {
       const Rrel = matMul3(matT3(R[pr.j]), R[pr.i]); // cam i -> world -> cam j
       const ci = cam(pr.i), cj = cam(pr.j);
       for (const [xi, yi, xj, yj] of pr.m) {
-        const u = rayFromFilm((xi - ci.cx) / ci.f, (yi - ci.cy) / ci.f, kk1, kk2, kk3, ll);
+        const u = rayFromFilm(xi - ci.cx, yi - ci.cy, ci.f, kk1, kk2, kk3, ll);
         const d = matVec3(Rrel, u); // camera looks -Z
         const z = Math.min(d[2], -0.05);              // smooth clamp (no behind-camera spikes)
-        const p = filmFromRay([d[0], d[1], z], kk1, kk2, kk3, ll);
-        let rx = cj.cx + cj.f * p[0] - xj;
-        let ry = cj.cy + cj.f * p[1] - yj;
+        const p = filmFromRay([d[0], d[1], z], cj.f, kk1, kk2, kk3, ll);
+        let rx = cj.cx + p[0] - xj;
+        let ry = cj.cy + p[1] - yj;
         const r = Math.hypot(rx, ry);
         if (r > huber) { const s = Math.sqrt(huber / r); rx *= s; ry *= s; }
         res.push(rx, ry);
@@ -524,9 +552,11 @@ export function bundleAdjust(frames, gyroR, pairs, {
       res.push(priorW * t[k * 3], priorW * t[k * 3 + 1], priorW * t[k * 3 + 2]);
     }
     if (optimizeFocal) res.push(0.15 * t[FI]); // gentle focal prior
-    if (optimizeLens) res.push(0.2 * t[LI], 0.15 * t[K1I], 0.15 * t[K2I], 0.15 * t[K3I], 0.02 * t[CXI], 0.02 * t[CYI]);
+    if (optimizeLens) res.push(0.2 * t[LI]);
+    if (optimizeDistortion) res.push(0.15 * t[K1I], 0.15 * t[K2I], 0.15 * t[K3I]);
     if (optimizePerFrame) for (let k = 0; k < N; k++) if (used.has(k)) {
-      res.push(0.25 * t[PFI + k], 0.04 * t[PCXI + k], 0.04 * t[PCYI + k]);
+      res.push(0.25 * t[PFI + k]);
+      if (optimizePerFrameCenter) res.push(0.04 * t[PCXI + k], 0.04 * t[PCYI + k]);
     }
     return res;
   };

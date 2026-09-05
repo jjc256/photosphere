@@ -46,8 +46,11 @@ function openCVBackend(cv) {
       const desc = new cv.Mat();
       const mask = new cv.Mat();
       const detector = hasSift
-        ? (typeof cv.SIFT === 'function' ? new cv.SIFT(900)
-          : (cv.SIFT?.create ? cv.SIFT.create(900) : cv.SIFT_create(900)))
+        // Panorama's OpenCV SIFT backend keeps up to 2,750 features at the
+        // default 0.04 contrast threshold.  The previous 900-keypoint cap
+        // made low-texture transitions look disconnected before RANSAC.
+        ? (typeof cv.SIFT === 'function' ? new cv.SIFT(2750)
+          : (cv.SIFT?.create ? cv.SIFT.create(2750) : cv.SIFT_create(2750)))
         : new cv.ORB(1200, 1.2, 8);
       try {
         detector.detectAndCompute(src, mask, kps, desc);
