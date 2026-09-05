@@ -120,6 +120,9 @@ bool warp(out vec3 rgb, out float edge) {
   // sample where the ray actually landed on the sensor
   float xy = length(cam.xy);
   float theta = acos(clamp(-cam.z / length(cam), -1.0, 1.0));
+  // Stay on the invertible branch of the calibrated projection. Beyond
+  // this limit tan folds back and paints duplicate fragments of the frame.
+  if (abs(uLinearity) * theta >= PI * 0.5) return false;
   float radius = abs(uLinearity) < 1e-5 ? theta :
     (uLinearity > 0.0 ? tan(theta * uLinearity) / uLinearity : sin(theta * uLinearity) / uLinearity);
   vec2 ideal = xy < 1e-6 ? vec2(0.0) : cam.xy * (radius / xy);
@@ -130,11 +133,11 @@ bool warp(out vec3 rgb, out float edge) {
   vec2 distorted = idealRadius < 1e-6 ? vec2(0.0) : ideal * (distortedRadius / idealRadius);
   float px = distorted.x / uTan.x;
   float py = distorted.y / uTan.y;
-  if (max(abs(px), abs(py)) > 1.0) return false;
   vec2 rp = uVidRot * vec2(px, py);
   vec2 uv = rp * 0.5 + uCenter;
+  if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return false;
   rgb = clamp(texture(uFrame, uv).rgb * uGain, 0.0, 1.0);
-  edge = min(1.0 - abs(rp.x), 1.0 - abs(rp.y));   // distance to nearest frame edge, 0..1
+  edge = 2.0 * min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));   // distance to nearest frame edge, 0..1
   return true;
 }`;
 
@@ -188,7 +191,7 @@ void main() {
   float cost = texture(uCost, vUv).r;
   float center = smoothstep(0.02, 0.45, edge);
   float pri = clamp(center * edge - uLambda * cost, 0.0, 1.0) * uPriority;
-  gl_FragDepth = 1.0 - pri * 0.999;    // higher priority -> smaller depth -> wins
+  gl_FragDepth = 0.999 - pri * 0.998;    // higher priority -> smaller depth -> wins
   frag = vec4((uIndex + 1.0) / 255.0, edge, 0.0, 1.0);
 }`;
 
@@ -631,7 +634,7 @@ export class PanoEngine {
   // ---- multi-band seam compositor --------------------------------------
   // Standard stitcher compositing chain (OpenCV Stitcher / enblend):
   //   consensus mosaic -> content-aware seam labels -> Burt-Adelson
-  //   multi-band blend -> pole fill.
+  //   multi-band blend.
   // Intermediates run at 2048 wide to keep iOS GPU memory sane; the result
   // is upscaled into panoTex.
   _initComposite() {
@@ -678,12 +681,12 @@ export class PanoEngine {
     const c = Math.cos(a), s = Math.sin(a);
     gl.uniformMatrix3fv(gl.getUniformLocation(prog, 'uRot'), false, uRot);
     const focalScale = camera?.focalScale || 1;
-    gl.uniform2f(gl.getUniformLocation(prog, 'uTan'), tanX / focalScale, tanY / focalScale);
+    gl.uniform2f(gl.getUniformLocation(prog, 'uTan'), (camera?.tan?.[0] ?? tanX) / focalScale, (camera?.tan?.[1] ?? tanY) / focalScale);
     gl.uniform1f(gl.getUniformLocation(prog, 'uGain'), gain);
-    gl.uniform1f(gl.getUniformLocation(prog, 'uK1'), this._k1 || 0);
-    gl.uniform1f(gl.getUniformLocation(prog, 'uK2'), this._k2 || 0);
-    gl.uniform1f(gl.getUniformLocation(prog, 'uK3'), this._k3 || 0);
-    gl.uniform1f(gl.getUniformLocation(prog, 'uLinearity'), this._linearity || 1);
+    gl.uniform1f(gl.getUniformLocation(prog, 'uK1'), (this._k1 || 0) * focalScale);
+    gl.uniform1f(gl.getUniformLocation(prog, 'uK2'), (this._k2 || 0) * focalScale ** 2);
+    gl.uniform1f(gl.getUniformLocation(prog, 'uK3'), (this._k3 || 0) * focalScale ** 3);
+    gl.uniform1f(gl.getUniformLocation(prog, 'uLinearity'), this._linearity ?? 1);
     gl.uniformMatrix2fv(gl.getUniformLocation(prog, 'uVidRot'), false, [c, s, -s, c]);
     const center = camera?.center || this._center || [0.5, 0.5];
     gl.uniform2fv(gl.getUniformLocation(prog, 'uCenter'), center);
@@ -724,9 +727,7 @@ export class PanoEngine {
     // A gyro-only frame may be close enough to cover a hole, but it must not
     // influence a feature-aligned seam. Once we have a viable aligned set,
     // leave those uncertain areas empty instead of introducing ghost fragments.
-    const aligned = frames.filter((f) => !f.weak);
-    const blendFrames = aligned.length >= 2 ? aligned : frames;
-    const weakFrames = aligned.length >= 2 ? frames.filter((f) => f.weak) : [];
+    const blendFrames = frames.filter((f) => !f.weak);
     const rots = blendFrames.map((f) => matT3col(f.R));
     const warpTo = (prog, fbo, k) => {
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
@@ -849,7 +850,7 @@ export class PanoEngine {
       accBand(this.accLoFbo, this.mTex, 0);
     });
 
-    // ---- 4. collapse bands -> avgTex and fill only with captured imagery ---
+    // ---- 4. collapse bands -> avgTex ---
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.avgFbo);
     this._vp(); gl.disable(gl.BLEND);
     gl.useProgram(this.pCombine2);
@@ -859,36 +860,9 @@ export class PanoEngine {
     gl.uniform1i(gl.getUniformLocation(this.pCombine2, 'uLo'), 1);
     this._quad();
 
-    // A low-texture cap may not make the feature graph, but it is still more
-    // truthful than synthesising a pole. Use weak frames strictly as holes-only
-    // patches after the aligned panorama has been finalised.
-    let src = this.avgTex;
-    weakFrames.forEach((fr) => {
-      this._uploadFrame(fr.img);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.wFbo);
-      this._vp();
-      gl.useProgram(this.pWarpC);
-      this._warpUniforms(this.pWarpC, matT3col(fr.R), tanX, tanY,
-        fr.gain || 1, fr.vidRot || 0, fr.camera, fr.img);
-      gl.disable(gl.BLEND); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
-      this._quad();
-
-      const dstFbo = src === this.avgTex ? this.mFbo : this.avgFbo;
-      gl.bindFramebuffer(gl.FRAMEBUFFER, dstFbo);
-      this._vp(); gl.disable(gl.BLEND);
-      gl.useProgram(this.pHole);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src);
-      gl.uniform1i(gl.getUniformLocation(this.pHole, 'uBase'), 0);
-      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.wTex);
-      gl.uniform1i(gl.getUniformLocation(this.pHole, 'uFill'), 1);
-      this._quad();
-      src = src === this.avgTex ? this.mTex : this.avgTex;
-    });
-
-    // Do not invent a zenith or nadir from adjacent latitude rows. That old
-    // pole-fill pass made a radial flower when the user had not captured the
-    // pole; a guided pole shot (or an actual weak-frame patch) is the only
-    // geometrically honest way to close that coverage gap.
+    // Unverified frames have no common geometric anchor with this mosaic.
+    // Filling holes with them creates hard fragments at the coverage boundary.
+    const src = this.avgTex;
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.panoFbo);
     gl.viewport(0, 0, this.size, this.h); gl.disable(gl.BLEND);

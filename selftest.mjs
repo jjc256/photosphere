@@ -9,6 +9,13 @@ import {
 import { qToR, matVec3, matMul3, matT3, logSO3, expSO3 } from './js/ba.js';
 
 const DEG = Math.PI / 180;
+let randomState = 0x1234abcd;
+function random() {
+  randomState = (Math.imul(randomState, 1664525) + 1013904223) >>> 0;
+  return randomState / 4294967296;
+}
+const VID_ROT = Number(process.env.VID_ROT || 0);
+const turn = VID_ROT * Math.PI / 2;
 
 // ---- procedural scene -------------------------------------------------------
 function hash(ix, iy) {
@@ -42,7 +49,11 @@ function renderView(R, f, w, h) {
       let acc = 0;
       for (let sy = 0; sy < S; sy++) for (let sx = 0; sx < S; sx++) {
         const px = (x * S + sx + 0.5) - cx * S, py = (y * S + sy + 0.5) - cy * S;
-        const world = matVec3(R, [px / fs, py / fs, -1]);
+        // Real image rows run down; camera Y runs up. Undo the feed's
+        // quarter turn before applying the independently known camera pose.
+        const world = matVec3(R, [
+          (Math.cos(turn) * px - Math.sin(turn) * py) / fs,
+          (-Math.sin(turn) * px - Math.cos(turn) * py) / fs, -1]);
         const n = Math.hypot(...world);
         acc += scene(Math.atan2(world[0] / n, -world[2] / n),
           Math.asin(Math.max(-1, Math.min(1, world[1] / n))));
@@ -56,27 +67,27 @@ function renderView(R, f, w, h) {
 const qYawPitch = (yaw, pitch) => normalizeQuat(multiplyQuat(
   quatFromAxisAngle(0, 1, 0, yaw), quatFromAxisAngle(1, 0, 0, pitch)));
 function randSmallQuat(rad) {
-  const a = [Math.random() * 2 - 1, Math.random() * 2 - 1, Math.random() * 2 - 1];
+  const a = [random() * 2 - 1, random() * 2 - 1, random() * 2 - 1];
   const n = Math.hypot(...a) || 1;
-  return quatFromAxisAngle(a[0] / n, a[1] / n, a[2] / n, (Math.random() * 2 - 1) * rad);
+  return quatFromAxisAngle(a[0] / n, a[1] / n, a[2] / n, (random() * 2 - 1) * rad);
 }
 
 // ---- build frames --------------------------------------------------------------
 const W = 480, H = 360, HFOV = 55 * DEG;
-const F = (W / 2) / Math.tan(HFOV / 2);
+const F = ((VID_ROT % 2 ? H : W) / 2) / Math.tan(HFOV / 2);
 const yaws = [-75, -45, -15, 15, 45, 75].map((d) => d * DEG);
 const pitches = [-13 * DEG, 13 * DEG];
 
 const truthQ = [];
-for (const p of pitches) for (const yw of yaws) truthQ.push(qYawPitch(yw, p));
+for (const p of pitches) for (const yw of yaws) truthQ.push(normalizeQuat(multiplyQuat(qYawPitch(yw, p), quatFromAxisAngle(0, 0, 1, 7 * DEG))));
 
 const GYRO_NOISE = 2.5 * DEG;
 const shots = truthQ.map((qt) => {
   const noisy = normalizeQuat(multiplyQuat(randSmallQuat(GYRO_NOISE), qt));
-  const gain = 0.85 + Math.random() * 0.3;
+  const gain = 0.85 + random() * 0.3;
   const g = renderView(qToR(qt), F, W, H);
   for (let i = 0; i < g.length; i++) g[i] = Math.min(255, g[i] * gain);
-  return { gray: g, w: W, h: H, quat: noisy, hfovDeg: 55, _R: qToR(qt), _gain: gain };
+  return { gray: g, w: W, h: H, quat: noisy, hfovDeg: 55, vidRot: VID_ROT, _R: qToR(qt), _gain: gain };
 });
 
 console.log(`${shots.length} frames, gyro noise ${(GYRO_NOISE / DEG).toFixed(1)}deg, true focal ${F.toFixed(1)}px`);
@@ -102,7 +113,15 @@ console.log(`\nmean gyro ${meanGyro.toFixed(2)}°  |  mean est(connected) ${mean
 // est error is measured against absolute truth; the solution lives in the
 // gyro-anchored frame, so ~gyro-noise of global offset is expected. What must
 // hold: everything connected, focal recovered, and no frame wildly worse.
-const pass = res.ok && nConn >= shots.length - 1 && res.focalScale > 0.85 && res.focalScale < 1.18 && worst < 3.5;
+// Relative error removes the unavoidable global gyro anchor offset.
+let relativeWorst = 0;
+for (let i = 1; i < shots.length; i++) {
+  const expected = matMul3(matT3(shots[0]._R), shots[i]._R);
+  const actual = matMul3(matT3(res.rotations[0]), res.rotations[i]);
+  relativeWorst = Math.max(relativeWorst, Math.hypot(...logSO3(matMul3(actual, matT3(expected)))) / DEG);
+}
+console.log('worst relative rotation error:', relativeWorst.toFixed(3), 'degrees');
+const pass = relativeWorst < 1 && res.ok && nConn >= shots.length - 1 && res.focalScale > 0.85 && res.focalScale < 1.18 && worst < 3.5;
 if (!res.cameras.every((camera) => camera.center.every((v) => Number.isFinite(v) && v > 0.4 && v < 0.6))) {
   console.error('renderer camera centres are not normalized UV coordinates:', res.cameras);
   process.exit(1);

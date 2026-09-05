@@ -8,7 +8,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.16.1';
+const APP_VERSION = '0.16.2';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -558,7 +558,7 @@ async function toReview() {
   let result;
   try {
     result = await stitch(
-      state.shots.map((s) => ({ gray: s.gray, w: s.gw, h: s.gh, quat: s.quat, hfovDeg: s.hfovDeg })),
+      state.shots.map((s) => ({ gray: s.gray, w: s.gw, h: s.gh, quat: s.quat, hfovDeg: s.hfovDeg, vidRot: s.vidRot })),
       { onProgress: (stage, f) => { st.textContent = `Stitching · ${stage} ${Math.round(f * 100)}%`; } },
     );
   } catch (e) {
@@ -566,7 +566,7 @@ async function toReview() {
   }
   state._stitchLog = result.log || [];
   console.log('[stitch]', ...(result.log || []));
-  const nConn0 = (result.connected || []).filter(Boolean).length;
+  const nConn0 = (result.reliable || result.connected || []).filter(Boolean).length;
   const partial = !result.ok || nConn0 < state.shots.length;
   const diag = $('stitch-diag');
   diag.textContent = `v${APP_VERSION}\n` + (result.log || []).join('\n');
@@ -581,18 +581,17 @@ async function toReview() {
       const s0 = state.shots[0];
       const tanX = Math.tan((state.hfovDeg * DEG) / 2) / result.focalScale;
       const tanY = tanX * (s0.h / s0.w);
-      // Composite the aligned frames at full seam priority; unaligned frames
-      // are passed too but marked `weak` so they only fill gaps the aligned
-      // ones don't cover (better than a black hole).
+      // Only the main verified component shares a geometric anchor. Other
+      // components and gyro-only frames cannot safely fill its coverage gaps.
       const reliable = result.reliable || result.connected;
       const nReliable = reliable.filter(Boolean).length;
       const parts = state.shots.map((s, k) => ({
         img: s.imgData, R: result.rotations[k], gain: result.gains[k],
-        weak: nReliable >= 3 && !reliable[k],
+        weak: !reliable[k],
         vidRot: s.vidRot, camera: result.cameras?.[k],
       }));
       const center = result.center || [0.5, 0.5];
-      state.engine.compositeStitched(parts, tanX, tanY, result.k1 || 0, result.k2 || 0, result.k3 || 0, result.linearity || 1, center);
+      state.engine.compositeStitched(parts, tanX, tanY, result.k1 || 0, result.k2 || 0, result.k3 || 0, result.linearity ?? 1, center);
       if (nReliable < state.shots.length) toast(`Using ${nReliable} verified frames of ${state.shots.length}`);
     } else {
       state.engine.bake(); // gyro-only fallback (from the live splat accumulation)

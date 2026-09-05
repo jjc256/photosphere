@@ -462,7 +462,7 @@ export function refineRelRot(Rrel0, m0, f, {
     R = lm(R, m);
   }
   const fe = perErr(R, m);
-  return { Rrel: R, inl: m.length, rms: Math.hypot(...fe) / Math.sqrt(m.length) };
+  return { Rrel: R, matches: m, inl: m.length, rms: Math.hypot(...fe) / Math.sqrt(m.length) };
 }
 
 // RANSAC directly in the calibrated camera model. Homographies cannot describe
@@ -553,7 +553,7 @@ export function bundleAdjust(frames, gyroR, pairs, {
   optimizeLens = false, optimizeDistortion = false, optimizePerFrame = false, optimizePerFrameCenter = false,
   minLinearity = -1.8, maxLinearity = 1.8,
   priorW = 0.05, huber = 12, iters = 40, anchor = 0,
-  normalSolver = null,
+  normalSolver = null, initialCameras = null,
 } = {}) {
   const N = frames.length;
   const theta = new Float64Array(6 * N + 7); // rotations + shared lens + per-frame f/cx/cy
@@ -589,9 +589,9 @@ export function bundleAdjust(frames, gyroR, pairs, {
 
   const frameR = (param, k) => matMul3(expSO3([param(k * 3), param(k * 3 + 1), param(k * 3 + 2)]), gyroR[k]);
   const camera = (param, k) => {
-    const f = mul(mul(focal0, exp(param(FI))), exp(param(PFI + k)));
-    const ccx = add(add(cx, param(CXI)), param(PCXI + k));
-    const ccy = add(add(cy, param(CYI)), param(PCYI + k));
+    const f = mul(mul(focal0 * (initialCameras?.[k]?.focalScale ?? 1), exp(param(FI))), exp(param(PFI + k)));
+    const ccx = add(add(initialCameras?.[k]?.cx ?? cx, param(CXI)), param(PCXI + k));
+    const ccy = add(add(initialCameras?.[k]?.cy ?? cy, param(CYI)), param(PCYI + k));
     return { f, cx: ccx, cy: ccy };
   };
   const lens = (param) => ({
@@ -754,7 +754,7 @@ export function bundleAdjust(frames, gyroR, pairs, {
   const outLinearity = Math.max(minLinearity, Math.min(maxLinearity, linearity + theta[LI]));
   return { R: curR(theta), focal, linearity: outLinearity,
     k1: k1 + theta[K1I], k2: k2 + theta[K2I], k3: k3 + theta[K3I], cx: outCx, cy: outCy,
-    cameras: Array.from({ length: N }, (_, k) => ({ focalScale: Math.exp(theta[PFI + k]), cx: outCx + theta[PCXI + k], cy: outCy + theta[PCYI + k] })), cost: c0 };
+    cameras: Array.from({ length: N }, (_, k) => ({ focalScale: (initialCameras?.[k]?.focalScale ?? 1) * Math.exp(theta[PFI + k]), cx: (initialCameras?.[k]?.cx ?? cx) + theta[CXI] + theta[PCXI + k], cy: (initialCameras?.[k]?.cy ?? cy) + theta[CYI] + theta[PCYI + k] })), cost: c0 };
 }
 
 // ---- gain compensation ---------------------------------------------------------

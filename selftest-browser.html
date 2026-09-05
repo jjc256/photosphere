@@ -1,0 +1,115 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>PhotoSphere renderer regression checks</title>
+<pre id="result">Running…</pre>
+<canvas id="canvas" width="512" height="256"></canvas>
+<script type="module">
+import { PanoEngine } from './js/pano.js';
+import { filmPoint, renderCamera } from './js/camera-geometry.js';
+import { bundleAdjust, matT3, expSO3, matVec3 } from './js/ba.js';
+import { featureBackend } from './js/cv-features.js';
+
+const assert = (ok, message) => { if (!ok) throw new Error(message); };
+try {
+  const engine = new PanoEngine(document.querySelector('canvas'));
+  engine.size = 512; engine.h = 256;
+  engine._initComposite();
+  const gl = engine.gl, logs = [];
+  // A source-coordinate ramp makes incorrect flips, centres and lens warps
+  // directly measurable in the actual WebGL output, without visual guessing.
+  const img = new ImageData(800, 600);
+  for (let y = 0; y < img.height; y++) for (let x = 0; x < img.width; x++) {
+    const i = (y * img.width + x) * 4;
+    img.data.set([255 * (x + 0.5) / img.width, 255 * (y + 0.5) / img.height, 128, 255], i);
+  }
+  const R = expSO3([0.15, -0.3, 0.12]);
+  for (const vidRot of [0, 1, 2, 3]) for (const L of [0, 1, 1.8, -0.7]) {
+    const shot = { w: 400, h: 300, vidRot };
+    const focal = 0.55, scale = 1.18, a = -0.16, b = 0.08, c = -0.02;
+    const camera = renderCamera(shot, { focalScale: scale, cx: 0.02, cy: -0.015 }, focal);
+    engine._k1 = a * focal; engine._k2 = b * focal ** 2; engine._k3 = c * focal ** 3;
+    engine._linearity = L;
+    engine._uploadFrame(img);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, engine.wFbo);
+    gl.viewport(0, 0, 512, 256);
+    gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(engine.pWarpC);
+    engine._warpUniforms(engine.pWarpC, matT3(R), 1, 1, 1, vidRot, camera, img);
+    engine._quad();
+    const pixels = new Uint8Array(512 * 256 * 4);
+    gl.readPixels(0, 0, 512, 256, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    let checked = 0, maxError = 0;
+    for (let y = 1; y < 256; y += 3) for (let x = 1; x < 512; x += 3) {
+      const lon = ((x + 0.5) / 512 - 0.5) * 2 * Math.PI;
+      const lat = ((y + 0.5) / 256 - 0.5) * Math.PI;
+      const d = matVec3(matT3(R), [Math.cos(lat) * Math.sin(lon), Math.sin(lat), -Math.cos(lat) * Math.cos(lon)]);
+      const theta = Math.acos(-d[2]), i = (y * 512 + x) * 4;
+      if (d[2] >= 0 || Math.abs(L) * theta >= Math.PI / 2) {
+        assert(pixels[i + 3] === 0, 'projection folded outside its valid branch'); continue;
+      }
+      const r = focal * scale * (L === 0 ? theta : L > 0 ? Math.tan(theta * L) / L : Math.sin(theta * L) / L);
+      const rd = r + a * r ** 2 + b * r ** 3 + c * r ** 4;
+      const fx = rd * d[0] / Math.hypot(d[0], d[1]) + 0.02;
+      const fy = rd * d[1] / Math.hypot(d[0], d[1]) - 0.015;
+      const angle = vidRot * Math.PI / 2;
+      const u = 0.5 + Math.cos(angle) * fx - Math.sin(angle) * fy;
+      const v = 0.5 + (Math.sin(angle) * fx + Math.cos(angle) * fy) * 400 / 300;
+      if (u < 0.01 || u > 0.99 || v < 0.01 || v > 0.99) continue;
+      assert(pixels[i + 3] === 255, 'missing valid warp coverage');
+      maxError = Math.max(maxError, Math.abs(pixels[i] - u * 255), Math.abs(pixels[i + 1] - (1 - v) * 255));
+      const film = filmPoint(u * 400, (1 - v) * 300, shot);
+      assert(Math.hypot(film[0] - fx, film[1] - fy) < 1e-10, 'feature and renderer axes disagree');
+      checked++;
+    }
+    assert(checked > 100 && maxError < 2, `warp turn=${vidRot}, L=${L}: error ${maxError}, samples ${checked}`);
+    logs.push(`turn=${vidRot}, L=${L}: ${checked} pixels, max error ${maxError.toFixed(2)}/255`);
+  }
+  // Full seam/blend chain must preserve a single source right to its border;
+  // a zero-priority label used to fail the depth test and leave holes there.
+  const identity = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  engine.compositeStitched([{ img, R: identity, gain: 1 }], 0.5, 0.375);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, engine.panoFbo);
+  const blended = new Uint8Array(512 * 256 * 4);
+  gl.readPixels(0, 0, 512, 256, gl.RGBA, gl.UNSIGNED_BYTE, blended);
+  let covered = 0;
+  for (let y = 0; y < 256; y++) for (let x = 0; x < 512; x++) {
+    const lon = ((x + 0.5) / 512 - 0.5) * 2 * Math.PI;
+    const lat = ((y + 0.5) / 256 - 0.5) * Math.PI;
+    if (Math.cos(lon) <= 0) continue;
+    const px = Math.tan(lon) / 0.5, py = Math.tan(lat) / Math.cos(lon) / 0.375;
+    if (Math.max(Math.abs(px), Math.abs(py)) >= 0.99) continue;
+    const i = (y * 512 + x) * 4;
+    assert(blended[i + 3] === 255, 'seam labelling left a covered pixel empty');
+    assert(Math.abs(blended[i] - (px * 0.5 + 0.5) * 255) < 3, 'compositor changed source pixels');
+    covered++;
+  }
+  logs.push(`compositor: ${covered} source pixels preserved`);
+  // Weak frames must not create detached fragments, even in uncovered areas.
+  engine.compositeStitched([{ img, R: identity, gain: 1, weak: true }], 0.5, 0.375);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, engine.panoFbo);
+  gl.readPixels(0, 0, 512, 256, gl.RGBA, gl.UNSIGNED_BYTE, blended);
+  assert(blended.every((v, i) => i % 4 !== 3 || v === 0), 'unverified frame entered the mosaic');
+  const cameras = [{ focalScale: 0.94, cx: 0.01, cy: -0.02 }, { focalScale: 1.07, cx: -0.01, cy: 0.03 }];
+  const ba = bundleAdjust([{}, {}], [R, R], [], { focal0: 0.6, cx: 0, cy: 0, initialCameras: cameras, iters: 0 });
+  assert(JSON.stringify(ba.cameras) === JSON.stringify(cameras), 'BA discarded camera calibration');
+  // Exercise the production SIFT loader as well as shader compilation.
+  const vision = await featureBackend();
+  assert(vision.kind === 'OpenCV SIFT', `unexpected backend: ${vision.kind}`);
+  const texture = document.createElement('canvas'); texture.width = texture.height = 256;
+  const ctx = texture.getContext('2d'); ctx.fillStyle = '#222'; ctx.fillRect(0, 0, 256, 256);
+  for (let i = 0; i < 90; i++) {
+    ctx.fillStyle = i % 2 ? '#eee' : '#777'; ctx.beginPath();
+    ctx.arc((i * 73) % 256, (i * 113) % 256, 3 + i % 13, 0, 2 * Math.PI); ctx.fill();
+  }
+  const rgba = ctx.getImageData(0, 0, 256, 256).data;
+  const gray = Uint8Array.from({ length: 256 * 256 }, (_, i) => rgba[i * 4]);
+  const features = vision.detect(gray, 256, 256);
+  assert(features.kps.length > 0 && vision.match(features, features).length > 0, 'SIFT detection/matching failed');
+  assert(gl.getError() === gl.NO_ERROR, 'WebGL error');
+  window.testResult = { ok: true, logs };
+  document.querySelector('#result').textContent = 'PASS\n' + logs.join('\n');
+} catch (error) {
+  window.testResult = { ok: false, error: error.stack };
+  document.querySelector('#result').textContent = 'FAIL\n' + error.stack;
+}
+</script>

@@ -1,27 +1,24 @@
 // Feature-based panorama solver, run once when the user taps "Done".
 //
-//   ORB features  ->  match IMU-adjacent pairs  ->  RANSAC homography
-//   ->  focal length from the homographies (median)
-//   ->  per-pair relative-rotation refinement (Gauss-Newton)
-//   ->  global L2 rotation averaging, anchored to the gyro
-//   ->  gain compensation
+//   SIFT/ORB features -> all-pairs matching -> calibrated-ray RANSAC
+//   -> shared lens calibration -> robust pair refinement
+//   -> incremental and global bundle adjustment -> gain compensation
 //
-// Input  shots: [{ gray:Uint8, w, h, quat:[x,y,z,w], hfovDeg }]  (gray = a
+// Input  shots: [{ gray:Uint8, w, h, quat:[x,y,z,w], hfovDeg, vidRot }]  (gray = a
 //        downscaled luma copy; quat is the device pose, camera->world).
 // Output { rotations:[mat3 row-major per shot], focalScale, gains:[per shot],
 //          connected:[bool], ok, log }
 
+import { filmPoint, filmSize, renderCamera } from './camera-geometry.js';
 import { featureBackend } from './cv-features.js';
 import { generalizedLensSolver } from './solver-wasm.js';
 import { globalBundleAdjust } from './solver-worker-client.js';
 import {
-  ransacHomography, focalFromHomography, ransacGeneralizedRotation, refineRelRot,
+  ransacHomography, focalFromHomography, relRotFromHomography, ransacGeneralizedRotation, refineRelRot,
   bundleAdjust, gainCompensate, qToR, matMul3, matT3, logSO3, setGeneralizedLensKernel,
 } from './ba.js';
 
 const DEG = Math.PI / 180;
-const fwd = (R) => [-R[6], -R[7], -R[8]];
-const angBetween = (a, b) => Math.acos(Math.min(1, Math.max(-1, a[0] * b[0] + a[1] * b[1] + a[2] * b[2])));
 const median = (a) => { const s = [...a].sort((x, y) => x - y); return s.length ? s[s.length >> 1] : NaN; };
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -57,6 +54,7 @@ function incrementalBuild(N, edges, gyroR, frames, {
   const activeEdges = [];
   const uf = new UnionFind(N);
   const remaining = edges.slice().sort((a, b) => (b.w || 0) - (a.w || 0));
+  let cameras = frames.map(() => ({ focalScale: 1, cx, cy }));
   let curFocal = focal, curLinearity = linearity, curK1 = k1, curK2 = k2, curK3 = k3;
 
   const addEdge = (edge) => {
@@ -71,7 +69,7 @@ function incrementalBuild(N, edges, gyroR, frames, {
 
   const runBA = (iters, optimizeDistortion = false) => {
     const ba = bundleAdjust(frames, rotations, activeEdges.map((e) => ({ i: e.i, j: e.j, m: e.mc })), {
-      focal0: curFocal, cx, cy, k1: curK1, k2: curK2, k3: curK3, linearity: curLinearity,
+      focal0: curFocal, initialCameras: cameras, cx, cy, k1: curK1, k2: curK2, k3: curK3, linearity: curLinearity,
       optimizeFocal: true, optimizeLens: !optimizeDistortion, optimizeDistortion,
       optimizePerFrame: true, optimizePerFrameCenter: false,
       minLinearity: -1.2, maxLinearity: 1.8,
@@ -80,6 +78,7 @@ function incrementalBuild(N, edges, gyroR, frames, {
     });
     if (!ba.R.every((R) => R.every((v) => isFinite(v))) || !isFinite(ba.focal)) return false;
     for (let k = 0; k < N; k++) rotations[k] = ba.R[k];
+    cameras = ba.cameras;
     curFocal = ba.focal;
     curLinearity = ba.linearity;
     curK1 = ba.k1; curK2 = ba.k2; curK3 = ba.k3;
@@ -108,22 +107,22 @@ function incrementalBuild(N, edges, gyroR, frames, {
   }
 
   if (activeEdges.length) runBA(N > 24 ? 10 : 18, false);
-  return { rotations, focal: curFocal, linearity: curLinearity, k1: curK1, k2: curK2, k3: curK3, built, activeEdges, uf };
+  return { rotations, cameras, focal: curFocal, linearity: curLinearity, k1: curK1, k2: curK2, k3: curK3, built, activeEdges, uf };
 }
 
 export async function stitch(shots, { onProgress = () => {} } = {}) {
   const N = shots.length;
   const log = [];
   const gyroR = shots.map((s) => qToR(s.quat));
+  if (!N) return { rotations: [], cameras: [], gains: [], connected: [], reliable: [], focalScale: 1, ok: false, log: ['need >= 2 frames'] };
   const hfov = (shots[0].hfovDeg || 55) * DEG;
   const w = shots[0].w, h = shots[0].h;
   // Panorama stores feature/film coordinates centred and divided by the
   // longer image edge.  Its camera, PTLens coefficients and RANSAC thresholds
   // all live in that unit system, so retain it through bundle adjustment.
   const coordinateScale = Math.max(w, h);
-  const outCx = w / 2, outCy = h / 2;
   let cx = 0, cy = 0;
-  const focal0 = ((w / 2) / Math.tan(hfov / 2)) / coordinateScale;
+  const focal0 = ((filmSize(shots[0])[0] / 2) / Math.tan(hfov / 2)) / coordinateScale;
   const bail = () => ({ rotations: gyroR, focalScale: 1, k1: 0, k2: 0, k3: 0, gains: shots.map(() => 1), connected: shots.map(() => true), ok: false, log });
 
   if (N < 2) { log.push('need >= 2 frames'); return bail(); }
@@ -175,8 +174,8 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     if (raw.length >= 40) {
       const pa = raw.map(([a]) => [feats[i].kps[a].x, feats[i].kps[a].y]);
       const pb = raw.map(([, b]) => [feats[j].kps[b].x, feats[j].kps[b].y]);
-      const ca = pa.map((p) => [(p[0] - outCx) / coordinateScale, (p[1] - outCy) / coordinateScale]);
-      const cb = pb.map((p) => [(p[0] - outCx) / coordinateScale, (p[1] - outCy) / coordinateScale]);
+      const ca = pa.map((p) => filmPoint(p[0], p[1], shots[i]));
+      const cb = pb.map((p) => filmPoint(p[0], p[1], shots[j]));
       // Direct calibrated-ray RANSAC decides whether the images overlap.
       const gyroSeed = matMul3(matT3(gyroR[j]), gyroR[i]);
       const geometric = ransacGeneralizedRotation(ca.map((p, k) => [p[0], p[1], cb[k][0], cb[k][1]]), focal0, gyroSeed,
@@ -309,13 +308,13 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   for (let e = 0; e < verified.length; e++) {
     onProgress('optimizing', 0.2 + e / verified.length * 0.5);
     const v = verified[e];
-    const { Rrel, rms, inl } = refineRelRot(seedFor(v, focal), v.mc, focal, {
+    const { Rrel, rms, inl, matches } = refineRelRot(seedFor(v, focal), v.mc, focal, {
       k1, k2, k3, linearity, outlierFloor: 2.5 / coordinateScale,
     });
     // accept a pair if it aligns tightly, OR loosely but with lots of inliers
     // (wide-baseline / mild parallax pairs still anchor the graph)
     if (inl >= 10 && (rms < 4 / coordinateScale || (rms < 6.5 / coordinateScale && inl >= 25))) {
-      edges.push({ i: v.i, j: v.j, Rrel, w: Math.min(inl, 120), mc: v.mc });
+      edges.push({ i: v.i, j: v.j, Rrel, w: Math.min(inl, 120), mc: matches });
     }
     v.rms = rms;
     await tick();
@@ -340,9 +339,10 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   const connected = inc.built.map((ok, i) => ok && sizeOf[root[i]] > 1);
   const comps = Object.values(sizeOf).filter((n) => n > 1).sort((a, b) => b - a);
   log.push(`incremental BA: ${connected.filter(Boolean).length}/${N} in ${comps.length} clusters [${comps.join(',')}]`);
-  const reliable = inc.built.map((ok, i) => ok && sizeOf[root[i]] >= 3);
+  const mainRoot = Object.keys(sizeOf).sort((a, b) => sizeOf[b] - sizeOf[a])[0];
+  const reliable = inc.built.map((ok, i) => ok && String(root[i]) === mainRoot);
   log.push(`coherent frames: ${reliable.filter(Boolean).length}/${N}`);
-  let cameras = shots.map(() => ({ focalScale: 1, cx: outCx, cy: outCy }));
+  let cameras = inc.cameras;
 
   // 7. Final reprojection solve over every edge the incremental builder folded
   // into the panorama.
@@ -352,7 +352,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   if (allPairs.length) {
     try {
       const ba = await globalBundleAdjust(shots.map(() => ({ w, h })), rotations, allPairs, {
-        focal0: focal, cx, cy, k1, k2, k3, linearity, optimizeFocal: true, optimizeLens: true, optimizeDistortion: false,
+        focal0: focal, initialCameras: cameras, cx, cy, k1, k2, k3, linearity, optimizeFocal: true, optimizeLens: true, optimizeDistortion: false,
         optimizePerFrame: true, optimizePerFrameCenter: false,
         minLinearity: -1.2, maxLinearity: 1.8,
         priorW: 0.08, huber: 5 / coordinateScale, iters: N > 24 ? 4 : 10,
@@ -362,7 +362,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
         cameras = ba.cameras;
         log.push(`global BA: focal ${(focal * coordinateScale).toFixed(1)}, L ${linearity.toFixed(3)}, a ${k1.toFixed(5)}, b ${k2.toFixed(5)}, c ${k3.toFixed(5)}`);
       }
-    } catch { /* retain rotation average if the numeric solve is ill-conditioned */ }
+    } catch { /* retain the complete incremental calibration */ }
   }
   onProgress('optimizing', 1);
 
@@ -379,22 +379,11 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     sub.forEach((orig, k) => { gains[orig] = clamp(gg[k], 0.6, 1.6); });
   }
 
-  // Small isolated components are locally aligned but not tied to the broader
-  // panorama. Render them as weak evidence so a tiny island cannot overwrite
-  // a larger, coherent view at a seam.
-  // The WebGL warp works in angular radius. Convert Panorama's film-radius
-  // PTLens coefficients at the solved focal length for that renderer only.
-  // BA works in centered feature coordinates at the small analysis size.
-  // The compositor samples a separately sized full-colour image, so expose
-  // principal points as resolution-independent UV coordinates.  Returning
-  // analysis pixels here shifted a 512px solve to roughly (0.32, 0.32) on an
-  // 800px frame instead of the optical centre (0.5, 0.5).
-  const renderCameras = cameras.map((camera) => ({
-    focalScale: camera.focalScale,
-    center: [0.5 + camera.cx / w, 0.5 + camera.cy / h],
-  }));
+  // Convert normalized film calibration to source texture UVs and angular
+  // distortion coefficients. Per-frame focal powers are applied in WebGL.
+  const renderCameras = cameras.map((camera, i) => renderCamera(shots[i], camera, focal));
   return { rotations, focalScale: focal / focal0, k1: k1 * focal, k2: k2 * focal * focal, k3: k3 * focal * focal * focal,
-    linearity, center: [0.5 + cx / w, 0.5 + cy / h], cameras: renderCameras, gains, connected, reliable, ok: true, log };
+    linearity, center: renderCameras[0].center, cameras: renderCameras, gains, connected, reliable, ok: true, log };
 }
 
 class UnionFind {

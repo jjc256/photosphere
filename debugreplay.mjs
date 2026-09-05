@@ -17,7 +17,7 @@ console.log('');
 
 const shots = d.shots.map((s) => ({
   gray: Uint8ClampedArray.from(Buffer.from(s.grayB64, 'base64')),
-  w: s.gw, h: s.gh, quat: s.quat, hfovDeg: s.hfovDeg ?? d.hfovDeg,
+  w: s.gw, h: s.gh, quat: s.quat, hfovDeg: s.hfovDeg ?? d.hfovDeg, vidRot: s.vidRot || 0,
 }));
 
 console.log("per-frame: size  meanGray min..max  stddev  ORBfeat  captureFeat");

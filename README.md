@@ -47,7 +47,7 @@ Alternatives that avoid the cert warning: run any static host
 2. A lattice of **dots** appears around you. Line the centre crosshair up with a
    dot and **hold still** — a ring fills and the frame is grabbed automatically
    (blurred grabs are rejected). The dot turns green; move to the next one.
-3. Pivot the phone around *your own body*, keeping it close to you — don't walk;
+3. Rotate around the camera lens, keeping the lens in one place — don't walk;
    parallax is what breaks hand-held stitching. Keep textured things in frame.
 4. Work outward through the dots (the counter shows how many are done). You
    don't have to get them all — tap **Done** once you've covered what you want.
@@ -69,31 +69,30 @@ the rare browser that hands the camera feed sideways.
 | Piece | What it does |
 |---|---|
 | `js/orientation.js` | Turns iOS `deviceorientation` (`alpha/beta/gamma` + screen angle) into a camera→world rotation matrix (three.js `DeviceOrientationControls` math). |
-| `js/cv-features.js` + `js/vendor/opencv.js` | On-device **OpenCV WebAssembly** vision backend, custom-built with SIFT enabled and SIMD. It uses SIFT descriptors with BF L2 cross-checking; the prior compact JavaScript ORB implementation remains only as an offline/runtime fallback. |
+| `js/cv-features.js` + `js/vendor/opencv.js` | On-device **OpenCV WebAssembly** vision backend, custom-built with SIFT enabled and SIMD. It uses SIFT descriptors with BF L2 nearest-neighbor ratio filtering; the prior compact JavaScript ORB implementation remains only as an offline/runtime fallback. |
 | `solver/` + `js/ba.js` | Rust WebAssembly generalized-camera kernel (Gennery projection) plus geometry back-end: direct generalized-camera RANSAC, all-pairs overlap discovery, calibrated shared focal/principal-point/generalized projection (`L`)/three-coefficient PTLens radial model, regularized per-frame focal/principal-point correction, global pose-and-lens bundle adjustment, and gain compensation. `js/solver-worker.js` runs the global solve off the UI thread. |
 | `js/stitch.js` | Runs once on **Done**: OpenCV-WASM features → overlap-graph matching → RANSAC-verify → median focal → **calibrate the lens** (solve k₁ and polish the focal by minimising total pairwise reprojection error) → refine each pair's rotation → rotation-average → component bundle adjustment → gain-compensate. Frames without a coherent support group are kept out of the seam blend. |
-| `js/pano.js` | WebGL2 engine. `splat()` drives the live capture preview. `compositeStitched()` runs the standard stitcher compositing chain: warp every frame to the sphere → build a consensus mosaic → **content-aware seam labels** (border distance minus a blurred photometric-disagreement term, a cheap stand-in for Kwatra graph-cut seams, resolved with the depth buffer) → **Burt–Adelson multi-band blend** (each source's detail band weighted by its mask blurred narrowly, its base band by the same mask blurred widely) → pole fill → upscale to `panoTex`. Also the interactive sphere view and equirect read-back for export. |
+| `js/pano.js` | WebGL2 engine. `splat()` drives the live capture preview. `compositeStitched()` runs the standard stitcher compositing chain: warp every frame to the sphere → build a consensus mosaic → **content-aware seam labels** (border distance minus a blurred photometric-disagreement term, a cheap stand-in for Kwatra graph-cut seams, resolved with the depth buffer) → **Burt–Adelson multi-band blend** (each source's detail band weighted by its mask blurred narrowly, its base band by the same mask blurred widely) → upscale to `panoTex`. Also the interactive sphere view and equirect read-back for export. |
 | `js/xmp.js` | Builds the GPano XMP packet and splices metadata segments into the JPEG (EXIF then XMP, after `APP0`). |
 | `js/exif.js` | Hand-rolled big-endian **EXIF `APP1`** writer — GPS position, capture time, view direction — the tags Google Maps / Street View needs. |
 | `js/app.js` | Camera + permissions, the auto-capture heuristic (angular step ≈ 0.42 × FOV, only while steady), the coverage grid including explicit zenith/nadir captures, per-frame stash (full-res `ImageData` + a downscaled luma copy for features), the location watch, the review viewer, and export/download. |
 | `sw.js` + `manifest.webmanifest` | Offline app shell and Home-Screen install. |
 
-Stitching is **feature-based, seeded by the IMU**: the gyroscope gives a global
-first guess for every frame at once (no incremental drift), then ORB matches +
-rotation averaging pull the frames into photometric agreement and recover the
-lens — both focal length and radial distortion. Solving distortion matters more
-than it sounds: assuming a pinhole not only leaves residual error at the frame
-edges (exactly where seams land) but also biases the focal estimate badly — on a
-synthetic lens with k₁ = −0.18 the homography focal comes out 39% wrong, and
-recovers to 0.3% once k₁ is solved. The device gyro is the fallback at every level — an
-unmatched frame, or a capture with too little overlap, still lands roughly
-right. Shoot from **one spot** (pivot around yourself); parallax from close
-objects is the residual limit that a pure-rotation model can't remove.
+Stitching is **feature-based, seeded by the IMU**. SIFT matches (or ORB when
+OpenCV is unavailable) establish image overlaps. Robust pair alignment and
+incremental bundle adjustment refine camera poses and lens calibration. Feature
+coordinates and the WebGL renderer share right/up/−Z camera axes, including the
+frame-rotation correction. Only the largest verified component enters the final
+blend. If no pairs can be verified, the app explicitly falls back to its gyro
+preview.
 
-`selftest.mjs` (`node selftest.mjs`) renders 12 synthetic views at known poses,
-feeds the solver noisy gyro seeds, and checks recovery — at 2.5–5° IMU noise all
-frames connect, per-frame rotation error drops from ~1.4° to ~0.35°, focal is
-recovered to <0.5%, and per-frame gains are recovered.
+Shoot from **one spot**, rotating around the lens. Translation and nearby objects
+introduce parallax, which a pure-rotation camera model cannot eliminate.
+
+`selftest.mjs` renders 12 synthetic views with known poses and deterministic gyro
+noise, then checks recovered focal length and relative rotations. It uses actual
+top-down image rows and includes pitch and roll so image-axis errors cannot hide
+behind a successful horizontal sweep.
 
 ### Output
 
@@ -158,3 +157,18 @@ manifest.webmanifest
 icons/
 serve.mjs          # dev server (+ --cert)
 ```
+
+### Stitching regression checks
+
+Run `node selftest.mjs` and `VID_ROT=1 node selftest.mjs` for deterministic
+feature-to-pose checks with real top-down image rows, pitch, roll and a rotated
+video feed. The test checks relative rotations as well as absolute gyro anchoring.
+Open <http://localhost:8080/selftest-browser.html> with the development server
+running to verify the actual WebGL warp against known source coordinates across
+four frame rotations and four projection models, plus the browser SIFT backend.
+
+Feature pixels are converted to right/up camera axes before alignment. Calibration
+uses normalized film units; the renderer converts principal points to source UVs
+and applies distortion at each frame's calibrated focal length. Only the largest
+verified component contributes to the final stitch; unmatched areas remain empty
+rather than being patched with unrelated gyro-aligned fragments.
