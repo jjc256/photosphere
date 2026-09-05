@@ -535,6 +535,7 @@ export function bundleAdjust(frames, gyroR, pairs, {
     const res = [];
     for (const pr of pairs) {
       const Rrel = matMul3(matT3(R[pr.j]), R[pr.i]); // cam i -> world -> cam j
+      const Rinv = matT3(Rrel);
       const ci = cam(pr.i), cj = cam(pr.j);
       for (const [xi, yi, xj, yj] of pr.m) {
         const u = rayFromFilm(xi - ci.cx, yi - ci.cy, ci.f, kk1, kk2, kk3, ll);
@@ -543,9 +544,16 @@ export function bundleAdjust(frames, gyroR, pairs, {
         const p = filmFromRay([d[0], d[1], z], cj.f, kk1, kk2, kk3, ll);
         let rx = cj.cx + p[0] - xj;
         let ry = cj.cy + p[1] - yj;
-        const r = Math.hypot(rx, ry);
+        const v = rayFromFilm(xj - cj.cx, yj - cj.cy, cj.f, kk1, kk2, kk3, ll);
+        const back = matVec3(Rinv, v);
+        const bz = Math.min(back[2], -0.05);
+        const q = filmFromRay([back[0], back[1], bz], ci.f, kk1, kk2, kk3, ll);
+        let bx = ci.cx + q[0] - xi;
+        let by = ci.cy + q[1] - yi;
+        const r = Math.hypot(rx, ry, bx, by);
         if (r > huber) { const s = Math.sqrt(huber / r); rx *= s; ry *= s; }
-        res.push(rx, ry);
+        if (r > huber) { const s = Math.sqrt(huber / r); bx *= s; by *= s; }
+        res.push(rx, ry, bx, by);
       }
     }
     for (let k = 0; k < N; k++) {
