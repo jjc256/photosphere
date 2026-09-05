@@ -16,7 +16,7 @@ import { generalizedLensSolver } from './solver-wasm.js';
 import { globalBundleAdjust } from './solver-worker-client.js';
 import {
   ransacHomography, focalFromHomography, ransacGeneralizedRotation, refineRelRot,
-  rotationAverage, bundleAdjust, gainCompensate, qToR, matMul3, matT3, logSO3, setGeneralizedLensKernel,
+  bundleAdjust, gainCompensate, qToR, matMul3, matT3, logSO3, setGeneralizedLensKernel,
 } from './ba.js';
 
 const DEG = Math.PI / 180;
@@ -25,6 +25,91 @@ const angBetween = (a, b) => Math.acos(Math.min(1, Math.max(-1, a[0] * b[0] + a[
 const median = (a) => { const s = [...a].sort((x, y) => x - y); return s.length ? s[s.length >> 1] : NaN; };
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const tick = () => new Promise((r) => setTimeout(r, 0));
+const I3 = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+
+function polishPair(matchBlock, Rseed, focal, linearity, {
+  k1 = 0, k2 = 0, k3 = 0, coordinateScale = 512, iters = 8,
+} = {}) {
+  const Rj = matT3(Rseed);
+  const fit = bundleAdjust([{ w: 1, h: 1 }, { w: 1, h: 1 }], [I3, Rj], [{ i: 0, j: 1, m: matchBlock }], {
+    focal0: focal, cx: 0, cy: 0, k1, k2, k3, linearity,
+    optimizeFocal: true, optimizeLens: true, optimizeDistortion: false,
+    optimizePerFrame: true, optimizePerFrameCenter: false,
+    minLinearity: -1.2, maxLinearity: 1.8,
+    priorW: 0.005, huber: 4 / coordinateScale, iters, anchor: 0,
+  });
+  const rel = matMul3(matT3(fit.R[1]), fit.R[0]);
+  const scale0 = fit.cameras?.[0]?.focalScale || 1;
+  const scale1 = fit.cameras?.[1]?.focalScale || 1;
+  return {
+    Rrel: rel,
+    focal: fit.focal * Math.sqrt(scale0 * scale1),
+    linearity: fit.linearity,
+    cost: fit.cost,
+  };
+}
+
+function incrementalBuild(N, edges, gyroR, frames, {
+  focal, cx, cy, k1, k2, k3, linearity, coordinateScale,
+}) {
+  const rotations = gyroR.map((R) => R.slice());
+  const built = new Array(N).fill(false);
+  const activeEdges = [];
+  const uf = new UnionFind(N);
+  const remaining = edges.slice().sort((a, b) => (b.w || 0) - (a.w || 0));
+  let curFocal = focal, curLinearity = linearity, curK1 = k1, curK2 = k2, curK3 = k3;
+
+  const addEdge = (edge) => {
+    if (built[edge.i] && !built[edge.j]) rotations[edge.j] = matMul3(rotations[edge.i], matT3(edge.Rrel));
+    else if (!built[edge.i] && built[edge.j]) rotations[edge.i] = matMul3(rotations[edge.j], edge.Rrel);
+    else if (!built[edge.i] && !built[edge.j]) rotations[edge.j] = matMul3(rotations[edge.i], matT3(edge.Rrel));
+    built[edge.i] = true;
+    built[edge.j] = true;
+    uf.union(edge.i, edge.j);
+    activeEdges.push(edge);
+  };
+
+  const runBA = (iters, optimizeDistortion = false) => {
+    const ba = bundleAdjust(frames, rotations, activeEdges.map((e) => ({ i: e.i, j: e.j, m: e.mc })), {
+      focal0: curFocal, cx, cy, k1: curK1, k2: curK2, k3: curK3, linearity: curLinearity,
+      optimizeFocal: true, optimizeLens: !optimizeDistortion, optimizeDistortion,
+      optimizePerFrame: true, optimizePerFrameCenter: false,
+      minLinearity: -1.2, maxLinearity: 1.8,
+      priorW: 0.06, huber: 5 / coordinateScale, iters,
+      anchor: activeEdges[0]?.i || 0,
+    });
+    if (!ba.R.every((R) => R.every((v) => isFinite(v))) || !isFinite(ba.focal)) return false;
+    for (let k = 0; k < N; k++) rotations[k] = ba.R[k];
+    curFocal = ba.focal;
+    curLinearity = ba.linearity;
+    curK1 = ba.k1; curK2 = ba.k2; curK3 = ba.k3;
+    return true;
+  };
+
+  while (remaining.length) {
+    let idx = remaining.findIndex((e) => built[e.i] !== built[e.j]);
+    if (idx < 0) idx = remaining.findIndex((e) => built[e.i] && built[e.j] && uf.find(e.i) !== uf.find(e.j));
+    if (idx < 0) idx = remaining.findIndex((e) => !built[e.i] && !built[e.j]);
+    if (idx < 0) {
+      for (const e of remaining.splice(0)) if (built[e.i] && built[e.j] && uf.find(e.i) === uf.find(e.j)) activeEdges.push(e);
+      break;
+    }
+    const edge = remaining.splice(idx, 1)[0];
+    addEdge(edge);
+    runBA(activeEdges.length === 1 ? 12 : 8, false);
+
+    for (let i = remaining.length - 1; i >= 0; i--) {
+      const e = remaining[i];
+      if (built[e.i] && built[e.j] && uf.find(e.i) === uf.find(e.j)) {
+        activeEdges.push(e);
+        remaining.splice(i, 1);
+      }
+    }
+  }
+
+  if (activeEdges.length) runBA(N > 24 ? 10 : 18, false);
+  return { rotations, focal: curFocal, linearity: curLinearity, k1: curK1, k2: curK2, k3: curK3, built, activeEdges, uf };
+}
 
 export async function stitch(shots, { onProgress = () => {} } = {}) {
   const N = shots.length;
@@ -108,13 +193,31 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
           const t = inliers[k];
           mc.push([ca[t][0], ca[t][1], cb[t][0], cb[t][1]]);
         }
+        let Rseed = geometric.Rrel;
+        let pairFocal = focal0;
+        let pairLinearity = 1;
+        try {
+          const coarse = polishPair(mc, Rseed, focal0, 1, { coordinateScale, iters: 6 });
+          if (coarse.Rrel.every((x) => isFinite(x)) && isFinite(coarse.focal) && coarse.focal > 0.25 * focal0 && coarse.focal < 4 * focal0) {
+            Rseed = coarse.Rrel;
+            pairFocal = coarse.focal;
+            pairLinearity = coarse.linearity;
+          }
+          const fine = polishPair(mc, Rseed, pairFocal, pairLinearity, { coordinateScale, iters: 8 });
+          if (fine.Rrel.every((x) => isFinite(x)) && isFinite(fine.focal) && fine.focal > 0.25 * focal0 && fine.focal < 4 * focal0) {
+            Rseed = fine.Rrel;
+            pairFocal = fine.focal;
+            pairLinearity = fine.linearity;
+          }
+        } catch { /* keep the RANSAC seed */ }
         let si = 0, sj = 0;
         const gi = shots[i].gray, gj = shots[j].gray;
         for (const t of inliers) {
           si += gi[Math.round(pa[t][1]) * shots[i].w + Math.round(pa[t][0])] || 0;
           sj += gj[Math.round(pb[t][1]) * shots[j].w + Math.round(pb[t][0])] || 0;
         }
-        verified.push({ i, j, mc, inl: inliers.length, Ii: si / inliers.length / 255, Ij: sj / inliers.length / 255, H, Rseed: geometric.Rrel });
+        verified.push({ i, j, mc, inl: inliers.length, Ii: si / inliers.length / 255, Ij: sj / inliers.length / 255, H, Rseed, pairFocal, pairLinearity });
+        if (isFinite(pairFocal)) focals.push(pairFocal);
         if (H) for (const f of focalFromHomography(H)) if (f > 0.3 * focal0 && f < 3 * focal0) focals.push(f);
       }
     }
@@ -147,7 +250,10 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   const scoreCalib = (fl, kk, kk2, kk3, ll) => {
     let sse = 0, n = 0;
     for (const v of calibSet) {
-      const r = refineRelRot(seedFor(v, fl), v.mc, fl, { k1: kk, k2: kk2, k3: kk3, linearity: ll, iters: 8 });
+      const r = refineRelRot(seedFor(v, fl), v.mc, fl, {
+        k1: kk, k2: kk2, k3: kk3, linearity: ll, iters: 8,
+        outlierFloor: 2.5 / coordinateScale,
+      });
       if (r.inl >= 10 && r.rms < 20 / coordinateScale) { sse += r.rms * r.rms * r.inl; n += r.inl; }
     }
     return n ? Math.sqrt(sse / n) : 1e9;
@@ -187,77 +293,73 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
         const sc = scoreCalib(focal, k1, k2, kk3, linearity);
         if (sc < best) { best = sc; k3 = kk3; }
       }
-      for (const ll of [linearity - 0.2, linearity - 0.1, linearity + 0.1, linearity + 0.2]) {
-        if (ll < 0.2 || ll > 1.8) continue;
+      for (const ll of [linearity - 0.5, linearity - 0.25, linearity - 0.1, linearity + 0.1, linearity + 0.25, linearity + 0.5]) {
+        if (ll < -1.2 || ll > 1.8 || Math.abs(ll) < 1e-4) continue;
         const sc = scoreCalib(focal, k1, k2, k3, ll);
         if (sc < best) { best = sc; linearity = ll; }
       }
       await tick();
     }
     log.push(`lens: L ${linearity.toFixed(3)}, a ${k1.toFixed(5)}, b ${k2.toFixed(5)}, c ${k3.toFixed(5)}, focal ${(focal * coordinateScale).toFixed(1)} ` +
-      `(${(focal / focal0).toFixed(3)}x), pair rms ${best.toFixed(2)}px`);
+      `(${(focal / focal0).toFixed(3)}x), pair rms ${(best * coordinateScale).toFixed(2)}px`);
   }
 
   // 5. refine each pair's relative rotation with the calibrated lens
   const edges = [];
-  const UF = new UnionFind(N);
   for (let e = 0; e < verified.length; e++) {
     onProgress('optimizing', 0.2 + e / verified.length * 0.5);
     const v = verified[e];
-    const { Rrel, rms, inl } = refineRelRot(seedFor(v, focal), v.mc, focal, { k1, k2, k3, linearity });
+    const { Rrel, rms, inl } = refineRelRot(seedFor(v, focal), v.mc, focal, {
+      k1, k2, k3, linearity, outlierFloor: 2.5 / coordinateScale,
+    });
     // accept a pair if it aligns tightly, OR loosely but with lots of inliers
     // (wide-baseline / mild parallax pairs still anchor the graph)
     if (inl >= 10 && (rms < 4 / coordinateScale || (rms < 6.5 / coordinateScale && inl >= 25))) {
-      edges.push({ i: v.i, j: v.j, Rrel, w: Math.min(inl, 120), mc: v.mc }); UF.union(v.i, v.j);
+      edges.push({ i: v.i, j: v.j, Rrel, w: Math.min(inl, 120), mc: v.mc });
     }
     v.rms = rms;
     await tick();
   }
   log.push(`good edges: ${edges.length}`);
-  log.push('pairs: ' + verified.map((v) => `${v.i}-${v.j}:${(v.rms || 9).toFixed(1)}/${v.inl}`).join(' '));
+  log.push('pairs: ' + verified.map((v) => `${v.i}-${v.j}:${v.rms == null ? '9.0' : (v.rms * coordinateScale).toFixed(1)}/${v.inl}`).join(' '));
   if (edges.length === 0) return bail();
 
-  // 6. connected components. A low-texture stretch (blank wall, sky) breaks
-  // the match graph into several clusters; each is still internally solvable,
-  // so refine EVERY cluster rather than keeping only the biggest and throwing
-  // the rest back to raw gyro. Clusters are placed relative to each other by
-  // the gyro prior, which is what it is good at.
-  const root = Array.from({ length: N }, (_, i) => UF.find(i));
-  const sizeOf = {};
-  root.forEach((r) => (sizeOf[r] = (sizeOf[r] || 0) + 1));
-  const connected = root.map((r) => sizeOf[r] > 1);       // has at least one match
-  const comps = Object.values(sizeOf).filter((n) => n > 1).sort((a, b) => b - a);
-  log.push(`refined ${connected.filter(Boolean).length}/${N} in ${comps.length} clusters [${comps.join(',')}]`);
-  // A pair is evidence of local agreement. Three or more connected frames are
-  // the minimum for a component to be trusted at a panorama seam.
-  const reliable = root.map((r) => sizeOf[r] >= 3);
-  log.push(`coherent frames: ${reliable.filter(Boolean).length}/${N}`);
-
-  // 7. rotation averaging over the whole graph at once — nodes with no edge
-  // simply fall back to their prior, every cluster is solved in place.
+  // 6. Build the panorama the same way Panorama does: start from a pair, add
+  // images through verified edges, and bundle-adjust the growing model after
+  // each insertion. This is slower than one rotation average, but failure here
+  // is more expensive than runtime.
   onProgress('optimizing', 0.7);
-  const avg = rotationAverage(N, edges, gyroR, { priorW: 0.2, iters: 60 });
-  let rotations = gyroR.map((g, k) => {
-    if (!connected[k]) return g;
-    const drift = Math.hypot(...logSO3(matMul3(avg[k], matT3(g))));
-    return drift < 0.5 && avg[k].every((v) => isFinite(v)) ? avg[k] : g;
+  const inc = incrementalBuild(N, edges, gyroR, shots.map(() => ({ w, h })), {
+    focal, cx, cy, k1, k2, k3, linearity, coordinateScale,
   });
+  let rotations = inc.rotations;
+  focal = inc.focal; k1 = inc.k1; k2 = inc.k2; k3 = inc.k3; linearity = inc.linearity;
+  const root = Array.from({ length: N }, (_, i) => inc.uf.find(i));
+  const sizeOf = {};
+  inc.built.forEach((ok, i) => { if (ok) sizeOf[root[i]] = (sizeOf[root[i]] || 0) + 1; });
+  const connected = inc.built.map((ok, i) => ok && sizeOf[root[i]] > 1);
+  const comps = Object.values(sizeOf).filter((n) => n > 1).sort((a, b) => b - a);
+  log.push(`incremental BA: ${connected.filter(Boolean).length}/${N} in ${comps.length} clusters [${comps.join(',')}]`);
+  const reliable = inc.built.map((ok, i) => ok && sizeOf[root[i]] >= 3);
+  log.push(`coherent frames: ${reliable.filter(Boolean).length}/${N}`);
   let cameras = shots.map(() => ({ focalScale: 1, cx: outCx, cy: outCy }));
 
-  // 7b. One global reprojection solve. Isolated nodes remain anchored by their
-  // IMU priors while every verified edge shares the same lens calibration.
-  const allPairs = edges.map((e) => ({
+  // 7. Final reprojection solve over every edge the incremental builder folded
+  // into the panorama.
+  const allPairs = inc.activeEdges.map((e) => ({
     i: e.i, j: e.j, m: e.mc,
   }));
   if (allPairs.length) {
     try {
       const ba = await globalBundleAdjust(shots.map(() => ({ w, h })), rotations, allPairs, {
-        focal0: focal, cx, cy, k1, k2, k3, linearity, optimizeFocal: false, optimizeLens: true, optimizeDistortion: false,
+        focal0: focal, cx, cy, k1, k2, k3, linearity, optimizeFocal: true, optimizeLens: true, optimizeDistortion: false,
         optimizePerFrame: true, optimizePerFrameCenter: false,
+        minLinearity: -1.2, maxLinearity: 1.8,
         priorW: 0.08, huber: 5 / coordinateScale, iters: N > 24 ? 4 : 10,
       });
       if (ba.R.every((R) => R.every((v) => isFinite(v))) && isFinite(ba.focal)) {
         rotations = ba.R; focal = ba.focal; k1 = ba.k1; k2 = ba.k2; k3 = ba.k3; linearity = ba.linearity;
+        cameras = ba.cameras;
         log.push(`global BA: focal ${(focal * coordinateScale).toFixed(1)}, L ${linearity.toFixed(3)}, a ${k1.toFixed(5)}, b ${k2.toFixed(5)}, c ${k3.toFixed(5)}`);
       }
     } catch { /* retain rotation average if the numeric solve is ill-conditioned */ }
@@ -282,8 +384,17 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   // a larger, coherent view at a seam.
   // The WebGL warp works in angular radius. Convert Panorama's film-radius
   // PTLens coefficients at the solved focal length for that renderer only.
+  // BA works in centered feature coordinates at the small analysis size.
+  // The compositor samples a separately sized full-colour image, so expose
+  // principal points as resolution-independent UV coordinates.  Returning
+  // analysis pixels here shifted a 512px solve to roughly (0.32, 0.32) on an
+  // 800px frame instead of the optical centre (0.5, 0.5).
+  const renderCameras = cameras.map((camera) => ({
+    focalScale: camera.focalScale,
+    center: [0.5 + camera.cx / w, 0.5 + camera.cy / h],
+  }));
   return { rotations, focalScale: focal / focal0, k1: k1 * focal, k2: k2 * focal * focal, k3: k3 * focal * focal * focal,
-    linearity, cx: outCx, cy: outCy, cameras, gains, connected, reliable, ok: true, log };
+    linearity, center: [0.5 + cx / w, 0.5 + cy / h], cameras: renderCameras, gains, connected, reliable, ok: true, log };
 }
 
 class UnionFind {

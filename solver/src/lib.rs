@@ -72,12 +72,24 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn theta_to_radius(theta: f64, linearity: f64) -> f64 {
-    if linearity.abs() < 1.0e-8 { theta } else { (theta * linearity).tan() / linearity }
+    if linearity.abs() < 1.0e-8 {
+        theta
+    } else if linearity > 0.0 {
+        (theta * linearity).tan() / linearity
+    } else {
+        (theta * linearity).sin() / linearity
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn radius_to_theta(radius: f64, linearity: f64) -> f64 {
-    if linearity.abs() < 1.0e-8 { radius } else { (radius * linearity).atan() / linearity }
+    if linearity.abs() < 1.0e-8 {
+        radius
+    } else if linearity > 0.0 {
+        (radius * linearity).atan() / linearity
+    } else {
+        (radius * linearity).clamp(-1.0, 1.0).asin() / linearity
+    }
 }
 
 #[unsafe(no_mangle)]

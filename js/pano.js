@@ -120,7 +120,8 @@ bool warp(out vec3 rgb, out float edge) {
   // sample where the ray actually landed on the sensor
   float xy = length(cam.xy);
   float theta = acos(clamp(-cam.z / length(cam), -1.0, 1.0));
-  float radius = abs(uLinearity) < 1e-5 ? theta : tan(theta * uLinearity) / uLinearity;
+  float radius = abs(uLinearity) < 1e-5 ? theta :
+    (uLinearity > 0.0 ? tan(theta * uLinearity) / uLinearity : sin(theta * uLinearity) / uLinearity);
   vec2 ideal = xy < 1e-6 ? vec2(0.0) : cam.xy * (radius / xy);
   float xu = ideal.x;
   float yu = ideal.y;
@@ -684,7 +685,7 @@ export class PanoEngine {
     gl.uniform1f(gl.getUniformLocation(prog, 'uK3'), this._k3 || 0);
     gl.uniform1f(gl.getUniformLocation(prog, 'uLinearity'), this._linearity || 1);
     gl.uniformMatrix2fv(gl.getUniformLocation(prog, 'uVidRot'), false, [c, s, -s, c]);
-    const center = camera && image ? [camera.cx / image.width, camera.cy / image.height] : this._center || [0.5, 0.5];
+    const center = camera?.center || this._center || [0.5, 0.5];
     gl.uniform2fv(gl.getUniformLocation(prog, 'uCenter'), center);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.frameTex);

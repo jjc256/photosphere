@@ -103,5 +103,9 @@ console.log(`\nmean gyro ${meanGyro.toFixed(2)}°  |  mean est(connected) ${mean
 // gyro-anchored frame, so ~gyro-noise of global offset is expected. What must
 // hold: everything connected, focal recovered, and no frame wildly worse.
 const pass = res.ok && nConn >= shots.length - 1 && res.focalScale > 0.85 && res.focalScale < 1.18 && worst < 3.5;
+if (!res.cameras.every((camera) => camera.center.every((v) => Number.isFinite(v) && v > 0.4 && v < 0.6))) {
+  console.error('renderer camera centres are not normalized UV coordinates:', res.cameras);
+  process.exit(1);
+}
 console.log(pass ? '\nPASS ✅' : '\nFAIL ❌');
 process.exit(pass ? 0 : 1);

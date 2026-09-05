@@ -8,17 +8,17 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.16.0';
+const APP_VERSION = '0.16.1';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 // ---- captured-frame budget --------------------------------------------------
-const MAX_SHOTS = 50;   // memory-bounded; ImageData is kept for the final blend
-const CAP_LONG = 800;   // long side kept for compositing
-const GRAY_LONG = 512;  // long side used for feature detection
-const CAP_STEP = 12 * Math.PI / 180; // grab a frame every ~12° of pan (overlap guarantee)
-const FEAT_MIN = 20;    // capture-time corner floor (countCorners samples a 3px grid)
+const MAX_SHOTS = 80;   // favour solver redundancy over minimal capture count
+const CAP_LONG = 960;   // long side kept for compositing
+const GRAY_LONG = 640;  // long side used for feature detection
+const CAP_STEP = 8 * Math.PI / 180; // dense sweep frames keep adjacent overlap high
+const FEAT_MIN = 16;    // capture-time corner floor (countCorners samples a 3px grid)
 
 const state = {
   stream: null,
@@ -263,15 +263,17 @@ function doCapture(manual, target = null) {
 // A lattice of dots on the sphere, spaced ~60% of the field of view so
 // neighbouring shots overlap enough to stitch. Sized to the current FOV.
 function buildTargets() {
-  // Three overlap rings plus explicit cap captures. The latter prevent the
+  // Dense overlap rings plus explicit cap captures. The latter prevent the
   // equirectangular pole fill from inventing radial streaks at zenith/nadir.
-  // ~30° apart, which is ~35% overlap on the ~46° lens these phones actually
-  // have — the earlier 45° spacing left adjacent shots barely touching, which
-  // is why the match graph kept fragmenting.
+  // This intentionally oversamples compared with a pleasant manual capture:
+  // Panorama succeeds by having enough pair evidence, so the guide should feed
+  // the same kind of redundant graph instead of trying to be clever and sparse.
   const rings = [
-    { p: 0, n: 12 },
-    { p: 38, n: 9 },
-    { p: -38, n: 9 },
+    { p: 0, n: 18 },
+    { p: 32, n: 14 },
+    { p: -32, n: 14 },
+    { p: 62, n: 8 },
+    { p: -62, n: 8 },
   ];
   const T = [];
   rings.forEach((r, ri) => {
@@ -589,7 +591,7 @@ async function toReview() {
         weak: nReliable >= 3 && !reliable[k],
         vidRot: s.vidRot, camera: result.cameras?.[k],
       }));
-      const center = [result.cx / s0.w, result.cy / s0.h];
+      const center = result.center || [0.5, 0.5];
       state.engine.compositeStitched(parts, tanX, tanY, result.k1 || 0, result.k2 || 0, result.k3 || 0, result.linearity || 1, center);
       if (nReliable < state.shots.length) toast(`Using ${nReliable} verified frames of ${state.shots.length}`);
     } else {

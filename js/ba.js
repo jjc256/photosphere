@@ -1,9 +1,40 @@
-import { Dual, add as adAdd, mul as adMul } from './autodiff.js';
+import {
+  Dual, add as adAdd, sub as adSub, mul as adMul, div as adDiv,
+  sin as adSin, cos as adCos, sqrt as adSqrt, atan as adAtan,
+  asin as adAsin, exp as adExp, acos as adAcos, valueOf,
+} from './autodiff.js';
 
 // Geometry back-end for the stitcher: SO(3) exp/log, a dense linear solver,
 // homography RANSAC (for pair verification), IMU-seeded global bundle
 // adjustment over camera rotations + one shared focal length, and gain
 // compensation. Pure JS / Node-testable.
+
+const isDual = (x) => x instanceof Dual;
+const hasDual = (...xs) => xs.some(isDual);
+const val = valueOf;
+const add = (a, b) => hasDual(a, b) ? adAdd(a, b) : a + b;
+const sub = (a, b) => hasDual(a, b) ? adSub(a, b) : a - b;
+const mul = (a, b) => hasDual(a, b) ? adMul(a, b) : a * b;
+const div = (a, b) => hasDual(a, b) ? adDiv(a, b) : a / b;
+const sin = (a) => isDual(a) ? adSin(a) : Math.sin(a);
+const cos = (a) => isDual(a) ? adCos(a) : Math.cos(a);
+const sqrt = (a) => isDual(a) ? adSqrt(a) : Math.sqrt(a);
+const atan = (a) => isDual(a) ? adAtan(a) : Math.atan(a);
+const asin = (a) => isDual(a) ? adAsin(a) : Math.asin(a);
+const exp = (a) => isDual(a) ? adExp(a) : Math.exp(a);
+const acos = (a) => isDual(a) ? adAcos(a) : Math.acos(a);
+const hypot2 = (a, b) => hasDual(a, b) ? sqrt(add(mul(a, a), mul(b, b))) : Math.hypot(a, b);
+const hypot3 = (a, b, c) => hasDual(a, b, c) ? sqrt(add(add(mul(a, a), mul(b, b)), mul(c, c))) : Math.hypot(a, b, c);
+const minConst = (a, c) => isDual(a) ? (a.value < c ? a : Dual.constant(c, a.gradient.length)) : Math.min(a, c);
+const clampConst = (a, lo, hi) => {
+  if (!isDual(a)) return Math.max(lo, Math.min(hi, a));
+  if (a.value <= lo) return Dual.constant(lo, a.gradient.length);
+  if (a.value >= hi) return Dual.constant(hi, a.gradient.length);
+  return a;
+};
+const madd3 = (a, b, c, d, e, f) => hasDual(a, b, c, d, e, f)
+  ? add(add(mul(a, b), mul(c, d)), mul(e, f))
+  : a * b + c * d + e * f;
 
 // ---- small dense linear algebra ----------------------------------------------
 export function solveSPD(A, b, n) {
@@ -34,14 +65,21 @@ export function solveSPD(A, b, n) {
 
 // ---- SO(3) (all matrices row-major, active right-handed rotations) --------
 export function expSO3(w) {
-  const th = Math.hypot(w[0], w[1], w[2]);
-  if (th < 1e-9) return [1, 0, 0, 0, 1, 0, 0, 0, 1];
-  const x = w[0] / th, y = w[1] / th, z = w[2] / th;
-  const c = Math.cos(th), s = Math.sin(th), C = 1 - c;
+  const th = hypot3(w[0], w[1], w[2]);
+  if (val(th) < 1e-9) {
+    if (!hasDual(w[0], w[1], w[2])) return [1, 0, 0, 0, 1, 0, 0, 0, 1];
+    return [
+      1, sub(0, w[2]), w[1],
+      w[2], 1, sub(0, w[0]),
+      sub(0, w[1]), w[0], 1,
+    ];
+  }
+  const x = div(w[0], th), y = div(w[1], th), z = div(w[2], th);
+  const c = cos(th), s = sin(th), C = sub(1, c);
   return [
-    c + x * x * C, x * y * C - z * s, x * z * C + y * s,
-    x * y * C + z * s, c + y * y * C, y * z * C - x * s,
-    x * z * C - y * s, y * z * C + x * s, c + z * z * C,
+    add(c, mul(mul(x, x), C)), sub(mul(mul(x, y), C), mul(z, s)), add(mul(mul(x, z), C), mul(y, s)),
+    add(mul(mul(x, y), C), mul(z, s)), add(c, mul(mul(y, y), C)), sub(mul(mul(y, z), C), mul(x, s)),
+    sub(mul(mul(x, z), C), mul(y, s)), add(mul(mul(y, z), C), mul(x, s)), add(c, mul(mul(z, z), C)),
   ];
 }
 export function logSO3(R) {
@@ -84,14 +122,14 @@ export function rToQ(R) {
 export const matMul3 = (A, B) => {
   const C = new Array(9);
   for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++)
-    C[r * 3 + c] = A[r * 3] * B[c] + A[r * 3 + 1] * B[3 + c] + A[r * 3 + 2] * B[6 + c];
+    C[r * 3 + c] = madd3(A[r * 3], B[c], A[r * 3 + 1], B[3 + c], A[r * 3 + 2], B[6 + c]);
   return C;
 };
 export const matT3 = (A) => [A[0], A[3], A[6], A[1], A[4], A[7], A[2], A[5], A[8]];
 export const matVec3 = (A, v) => [
-  A[0] * v[0] + A[1] * v[1] + A[2] * v[2],
-  A[3] * v[0] + A[4] * v[1] + A[5] * v[2],
-  A[6] * v[0] + A[7] * v[1] + A[8] * v[2],
+  madd3(A[0], v[0], A[1], v[1], A[2], v[2]),
+  madd3(A[3], v[0], A[4], v[1], A[5], v[2]),
+  madd3(A[6], v[0], A[7], v[1], A[8], v[2]),
 ];
 
 // ---- homography RANSAC (pair inlier check) --------------------------------
@@ -261,39 +299,48 @@ export function relRotFromHomography(H, f) {
 let generalizedKernel = null;
 export function setGeneralizedLensKernel(kernel) { generalizedKernel = kernel; }
 const thetaToRadius = (theta, linearity) => generalizedKernel
+  && !hasDual(theta, linearity)
   ? generalizedKernel.theta_to_radius(theta, linearity)
-  : (Math.abs(linearity) < 1e-8 ? theta : Math.tan(theta * linearity) / linearity);
+  : (Math.abs(val(linearity)) < 1e-8 ? theta
+    : (val(linearity) > 0
+      ? div(div(sin(mul(theta, linearity)), cos(mul(theta, linearity))), linearity)
+      : div(sin(mul(theta, linearity)), linearity)));
 const radiusToTheta = (radius, linearity) => generalizedKernel
+  && !hasDual(radius, linearity)
   ? generalizedKernel.radius_to_theta(radius, linearity)
-  : (Math.abs(linearity) < 1e-8 ? radius : Math.atan(radius * linearity) / linearity);
+  : (Math.abs(val(linearity)) < 1e-8 ? radius
+    : (val(linearity) > 0
+      ? div(atan(mul(radius, linearity)), linearity)
+      : div(asin(clampConst(mul(radius, linearity), -1, 1)), linearity)));
 
 // Panorama's PTLens polynomial is expressed on radius, not as a scale factor:
 // r_d = r + a*r^2 + b*r^3 + c*r^4.
 export function distortPt(x, y, a = 0, b = 0, c = 0) {
-  const r = Math.hypot(x, y);
-  if (r < 1e-12 || (!a && !b && !c)) return [x, y];
-  const rd = generalizedKernel ? generalizedKernel.ptlens_distort(r, a, b, c)
-    : r + a * r * r + b * r * r * r + c * r * r * r * r;
-  return [x * rd / r, y * rd / r];
+  const r = hypot2(x, y);
+  if (val(r) < 1e-12 || (!hasDual(a, b, c) && !val(a) && !val(b) && !val(c))) return [x, y];
+  const r2 = mul(r, r), r3 = mul(r2, r), r4 = mul(r2, r2);
+  const rd = generalizedKernel && !hasDual(r, a, b, c) ? generalizedKernel.ptlens_distort(r, a, b, c)
+    : add(add(add(r, mul(a, r2)), mul(b, r3)), mul(c, r4));
+  return [div(mul(x, rd), r), div(mul(y, rd), r)];
 }
 
 export function undistortPt(x, y, a = 0, b = 0, c = 0) {
-  const rd = Math.hypot(x, y);
-  if (rd < 1e-12 || (!a && !b && !c)) return [x, y];
-  let r = generalizedKernel ? generalizedKernel.ptlens_undistort(rd, a, b, c) : rd;
-  if (!generalizedKernel) for (let i = 0; i < 10; i++) {
+  const rd = hypot2(x, y);
+  if (val(rd) < 1e-12 || (!hasDual(a, b, c) && !val(a) && !val(b) && !val(c))) return [x, y];
+  let r = generalizedKernel && !hasDual(rd, a, b, c) ? generalizedKernel.ptlens_undistort(rd, a, b, c) : rd;
+  if (!generalizedKernel || hasDual(rd, a, b, c)) for (let i = 0; i < 10; i++) {
     // This is the same forward-mode derivative mechanism used by Panorama's
     // parameter blocks. Using it here removes a hand-maintained polynomial
     // derivative from the camera inverse and keeps the model's calculus in
     // one implementation path.
-    const q = Dual.variable(r, 1, 0);
+    const q = Dual.variable(val(r), 1, 0);
     const q2 = adMul(q, q), q3 = adMul(q2, q), q4 = adMul(q2, q2);
-    const value = adAdd(adAdd(adAdd(q, adMul(q2, a)), adMul(q3, b)), adMul(q4, c));
+    const value = adAdd(adAdd(adAdd(q, adMul(a, q2)), adMul(b, q3)), adMul(c, q4));
     const deriv = value.gradient[0];
     if (Math.abs(deriv) < 1e-10) break;
-    r -= (value.value - rd) / deriv;
+    r = sub(r, div(sub(add(add(add(r, mul(a, mul(r, r))), mul(b, mul(mul(r, r), r))), mul(c, mul(mul(r, r), mul(r, r)))), rd), deriv));
   }
-  return [x * r / rd, y * r / rd];
+  return [div(mul(x, r), rd), div(mul(y, r), rd)];
 }
 
 // Panorama applies PTLens in film coordinates, *after* multiplying the
@@ -302,20 +349,20 @@ export function undistortPt(x, y, a = 0, b = 0, c = 0) {
 // implementation) describes a different camera.
 function rayFromFilm(x, y, focal, k1, k2, k3, linearity) {
   const u = undistortPt(x, y, k1, k2, k3);
-  const r = Math.hypot(u[0], u[1]);
-  if (r < 1e-12) return [0, 0, -1];
-  const theta = radiusToTheta(r / focal, linearity);
-  const s = Math.sin(theta) / r;
-  return [u[0] * s, u[1] * s, -Math.cos(theta)];
+  const r = hypot2(u[0], u[1]);
+  if (val(r) < 1e-12) return [0, 0, -1];
+  const theta = radiusToTheta(div(r, focal), linearity);
+  const s = div(sin(theta), r);
+  return [mul(u[0], s), mul(u[1], s), sub(0, cos(theta))];
 }
 
 function filmFromRay(d, focal, k1, k2, k3, linearity) {
-  const n = Math.hypot(d[0], d[1], d[2]) || 1;
-  const theta = Math.acos(Math.max(-1, Math.min(1, -d[2] / n)));
-  const xy = Math.hypot(d[0], d[1]);
-  if (xy < 1e-12) return [0, 0];
-  const r = thetaToRadius(theta, linearity) * focal;
-  return distortPt(d[0] * r / xy, d[1] * r / xy, k1, k2, k3);
+  const n = hypot3(d[0], d[1], d[2]) || 1;
+  const theta = acos(clampConst(div(sub(0, d[2]), n), -1, 1));
+  const xy = hypot2(d[0], d[1]);
+  if (val(xy) < 1e-12) return [0, 0];
+  const r = mul(thetaToRadius(theta, linearity), focal);
+  return distortPt(div(mul(d[0], r), xy), div(mul(d[1], r), xy), k1, k2, k3);
 }
 
 // Gauss-Newton refine of ONE relative rotation Rrel (cam_i ray -> cam_j ray)
@@ -323,7 +370,9 @@ function filmFromRay(d, focal, k1, k2, k3, linearity) {
 // Runs LM, drops gross mismatches that slipped past homography RANSAC
 // (periodic-texture false positives), then re-runs. Returns rms/inl on the
 // surviving inlier set.
-export function refineRelRot(Rrel0, m0, f, { iters = 20, k1 = 0, k2 = 0, k3 = 0, linearity = 1 } = {}) {
+export function refineRelRot(Rrel0, m0, f, {
+  iters = 20, k1 = 0, k2 = 0, k3 = 0, linearity = 1, outlierFloor = 2.5,
+} = {}) {
   // measured pixels are distorted: lift to ideal rays, and push predictions
   // back through the lens before comparing with the measured pixel.
   const rays = new Map();
@@ -401,7 +450,11 @@ export function refineRelRot(Rrel0, m0, f, { iters = 20, k1 = 0, k2 = 0, k3 = 0,
   for (let round = 0; round < 3; round++) {
     const e = perErr(R, m);
     const med = [...e].sort((a, b) => a - b)[e.length >> 1] || 1;
-    const cut = Math.max(2.5, 3 * med);
+    // `m0` is pixel-space in the public helper, but the stitcher deliberately
+    // supplies coordinates divided by the image's long edge.  Keep the robust
+    // floor in the caller's coordinate system rather than silently treating
+    // 2.5 normalized units as 2.5 pixels (which retained every bad match).
+    const cut = Math.max(outlierFloor, 3 * med);
     const keep = m.filter((_, k) => e[k] < cut);
     if (keep.length < 12) return { Rrel: R, inl: keep.length, rms: 99 };
     if (keep.length === m.length) break;
@@ -434,14 +487,14 @@ export function ransacGeneralizedRotation(matches, f, seedR, {
     const ids = new Set();
     while (ids.size < 4) ids.add(rnd() % matches.length);
     const sample = [...ids].map((i) => matches[i]);
-    const fit = refineRelRot(seedR, sample, f, { k1, k2, k3, linearity, iters: 7 });
+    const fit = refineRelRot(seedR, sample, f, { k1, k2, k3, linearity, iters: 7, outlierFloor: thresh * 0.625 });
     const inliers = [];
     for (const [i, e] of errors(fit.Rrel).entries()) if (e < thresh) inliers.push(i);
     if (inliers.length > best.inliers.length) best = { Rrel: fit.Rrel, inliers };
   }
   if (best.inliers.length < 25) return best;
   const refined = refineRelRot(best.Rrel, best.inliers.map((i) => matches[i]), f,
-    { k1, k2, k3, linearity, iters: 16 });
+    { k1, k2, k3, linearity, iters: 16, outlierFloor: thresh * 0.625 });
   const finalErr = errors(refined.Rrel);
   const inliers = [];
   // `thresh` is expressed in the caller's film-coordinate unit. Panorama
@@ -498,6 +551,7 @@ function weightedQuatAvg(list) {
 export function bundleAdjust(frames, gyroR, pairs, {
   focal0, cx, cy, k1 = 0, k2 = 0, k3 = 0, linearity = 1, optimizeFocal = true,
   optimizeLens = false, optimizeDistortion = false, optimizePerFrame = false, optimizePerFrameCenter = false,
+  minLinearity = -1.8, maxLinearity = 1.8,
   priorW = 0.05, huber = 12, iters = 40, anchor = 0,
   normalSolver = null,
 } = {}) {
@@ -525,6 +579,7 @@ export function bundleAdjust(frames, gyroR, pairs, {
     if (optimizePerFrameCenter) active.push(PCXI + k, PCYI + k);
   }
   const P = active.length;
+  const activeSlot = new Map(active.map((idx, p) => [idx, p]));
 
   const curR = (t) => {
     const R = [];
@@ -532,36 +587,50 @@ export function bundleAdjust(frames, gyroR, pairs, {
     return R;
   };
 
+  const frameR = (param, k) => matMul3(expSO3([param(k * 3), param(k * 3 + 1), param(k * 3 + 2)]), gyroR[k]);
+  const camera = (param, k) => {
+    const f = mul(mul(focal0, exp(param(FI))), exp(param(PFI + k)));
+    const ccx = add(add(cx, param(CXI)), param(PCXI + k));
+    const ccy = add(add(cy, param(CYI)), param(PCYI + k));
+    return { f, cx: ccx, cy: ccy };
+  };
+  const lens = (param) => ({
+    linearity: clampConst(add(linearity, param(LI)), minLinearity, maxLinearity),
+    k1: add(k1, param(K1I)),
+    k2: add(k2, param(K2I)),
+    k3: add(k3, param(K3I)),
+  });
+  const observationResidual = (param, pr, match) => {
+    const Ri = frameR(param, pr.i);
+    const Rj = frameR(param, pr.j);
+    const Rrel = matMul3(matT3(Rj), Ri); // cam i -> world -> cam j
+    const Rinv = matT3(Rrel);
+    const ci = camera(param, pr.i), cj = camera(param, pr.j);
+    const ln = lens(param);
+    const [xi, yi, xj, yj] = match;
+    const u = rayFromFilm(sub(xi, ci.cx), sub(yi, ci.cy), ci.f, ln.k1, ln.k2, ln.k3, ln.linearity);
+    const d = matVec3(Rrel, u); // camera looks -Z
+    const p = filmFromRay([d[0], d[1], minConst(d[2], -0.05)], cj.f, ln.k1, ln.k2, ln.k3, ln.linearity);
+    let rx = sub(add(cj.cx, p[0]), xj);
+    let ry = sub(add(cj.cy, p[1]), yj);
+    const v = rayFromFilm(sub(xj, cj.cx), sub(yj, cj.cy), cj.f, ln.k1, ln.k2, ln.k3, ln.linearity);
+    const back = matVec3(Rinv, v);
+    const q = filmFromRay([back[0], back[1], minConst(back[2], -0.05)], ci.f, ln.k1, ln.k2, ln.k3, ln.linearity);
+    let bx = sub(add(ci.cx, q[0]), xi);
+    let by = sub(add(ci.cy, q[1]), yi);
+    const r = Math.hypot(val(rx), val(ry), val(bx), val(by));
+    if (r > huber) {
+      const s = Math.sqrt(huber / r);
+      rx = mul(rx, s); ry = mul(ry, s); bx = mul(bx, s); by = mul(by, s);
+    }
+    return [rx, ry, bx, by];
+  };
+
   const residuals = (t) => {
-    const R = curR(t);
-    const f = focal0 * Math.exp(t[FI]);
-    const ll = Math.max(0.2, Math.min(1.8, linearity + t[LI]));
-    const kk1 = k1 + t[K1I], kk2 = k2 + t[K2I], kk3 = k3 + t[K3I];
-    const ccx = cx + t[CXI], ccy = cy + t[CYI];
-    const cam = (k) => ({ f: f * Math.exp(t[PFI + k]), cx: ccx + t[PCXI + k], cy: ccy + t[PCYI + k] });
+    const param = (idx) => t[idx];
     const res = [];
     for (const pr of pairs) {
-      const Rrel = matMul3(matT3(R[pr.j]), R[pr.i]); // cam i -> world -> cam j
-      const Rinv = matT3(Rrel);
-      const ci = cam(pr.i), cj = cam(pr.j);
-      for (const [xi, yi, xj, yj] of pr.m) {
-        const u = rayFromFilm(xi - ci.cx, yi - ci.cy, ci.f, kk1, kk2, kk3, ll);
-        const d = matVec3(Rrel, u); // camera looks -Z
-        const z = Math.min(d[2], -0.05);              // smooth clamp (no behind-camera spikes)
-        const p = filmFromRay([d[0], d[1], z], cj.f, kk1, kk2, kk3, ll);
-        let rx = cj.cx + p[0] - xj;
-        let ry = cj.cy + p[1] - yj;
-        const v = rayFromFilm(xj - cj.cx, yj - cj.cy, cj.f, kk1, kk2, kk3, ll);
-        const back = matVec3(Rinv, v);
-        const bz = Math.min(back[2], -0.05);
-        const q = filmFromRay([back[0], back[1], bz], ci.f, kk1, kk2, kk3, ll);
-        let bx = ci.cx + q[0] - xi;
-        let by = ci.cy + q[1] - yi;
-        const r = Math.hypot(rx, ry, bx, by);
-        if (r > huber) { const s = Math.sqrt(huber / r); rx *= s; ry *= s; }
-        if (r > huber) { const s = Math.sqrt(huber / r); bx *= s; by *= s; }
-        res.push(rx, ry, bx, by);
-      }
+      for (const m of pr.m) res.push(...observationResidual(param, pr, m));
     }
     for (let k = 0; k < N; k++) {
       res.push(priorW * t[k * 3], priorW * t[k * 3 + 1], priorW * t[k * 3 + 2]);
@@ -577,39 +646,91 @@ export function bundleAdjust(frames, gyroR, pairs, {
   };
 
   const cost = (r) => r.reduce((s, v) => s + v * v, 0);
-  let r0 = residuals(theta);
-  let c0 = cost(r0);
+  let c0 = cost(residuals(theta));
   let lambda = 1e-3;
-  const M = r0.length;
-  const EPS = 1e-4;
-
-  for (let it = 0; it < iters; it++) {
-    // numeric Jacobian over active params only (forward differences)
-    const J = Array.from({ length: P }, () => new Float64Array(M));
-    for (let p = 0; p < P; p++) {
-      const ai = active[p];
-      const save = theta[ai];
-      theta[ai] = save + EPS;
-      const rp = residuals(theta);
-      theta[ai] = save;
-      const col = J[p];
-      for (let m = 0; m < M; m++) col[m] = (rp[m] - r0[m]) / EPS;
+  const makeParam = (t, paramIds) => {
+    const localSlot = new Map(paramIds.map((idx, i) => [idx, i]));
+    return (idx) => localSlot.has(idx) ? Dual.variable(t[idx], paramIds.length, localSlot.get(idx)) : t[idx];
+  };
+  const addActive = (list, seen, idx) => {
+    if (activeSlot.has(idx) && !seen.has(idx)) { seen.add(idx); list.push(idx); }
+  };
+  const pairParamIds = (pr) => {
+    const ids = [], seen = new Set();
+    for (const k of [pr.i, pr.j]) for (let q = 0; q < 3; q++) addActive(ids, seen, k * 3 + q);
+    for (const idx of [FI, LI, K1I, K2I, K3I, CXI, CYI, PFI + pr.i, PFI + pr.j, PCXI + pr.i, PCXI + pr.j, PCYI + pr.i, PCYI + pr.j]) {
+      addActive(ids, seen, idx);
     }
-    // normal equations
+    return ids;
+  };
+  const pairBlocks = pairs.map((pr) => ({ pr, paramIds: pairParamIds(pr) }));
+  const scatterResidual = (H, g, rr, paramIds) => {
+    const v = val(rr);
+    if (!isDual(rr)) return v * v;
+    const grad = rr.gradient;
+    for (let a = 0; a < grad.length; a++) {
+      const ga = activeSlot.get(paramIds[a]);
+      const ja = grad[a];
+      if (!ja) continue;
+      g[ga] -= ja * v;
+      for (let b = a; b < grad.length; b++) {
+        const jb = grad[b];
+        if (!jb) continue;
+        const gb = activeSlot.get(paramIds[b]);
+        const h = ja * jb;
+        H[ga][gb] += h;
+        if (gb !== ga) H[gb][ga] += h;
+      }
+    }
+    return v * v;
+  };
+  const addPrior = (H, g, t, idx, weight) => {
+    const r = weight * t[idx];
+    const slot = activeSlot.get(idx);
+    if (slot !== undefined) {
+      H[slot][slot] += weight * weight;
+      g[slot] -= weight * r;
+    }
+    return r * r;
+  };
+  const buildNormal = (t) => {
     const H = Array.from({ length: P }, () => new Array(P).fill(0));
     const g = new Array(P).fill(0);
-    for (let a = 0; a < P; a++) {
-      const Ja = J[a];
-      for (let b = a; b < P; b++) {
-        const Jb = J[b];
-        let s = 0;
-        for (let m = 0; m < M; m++) s += Ja[m] * Jb[m];
-        H[a][b] = s; H[b][a] = s;
+    let total = 0;
+    for (const { pr, paramIds } of pairBlocks) {
+      const param = makeParam(t, paramIds);
+      for (const m of pr.m) {
+        for (const rr of observationResidual(param, pr, m)) total += scatterResidual(H, g, rr, paramIds);
       }
-      let s = 0;
-      for (let m = 0; m < M; m++) s += Ja[m] * r0[m];
-      g[a] = -s;
     }
+    for (let k = 0; k < N; k++) {
+      total += addPrior(H, g, t, k * 3, priorW);
+      total += addPrior(H, g, t, k * 3 + 1, priorW);
+      total += addPrior(H, g, t, k * 3 + 2, priorW);
+    }
+    if (optimizeFocal) total += addPrior(H, g, t, FI, 0.15);
+    if (optimizeLens) total += addPrior(H, g, t, LI, 0.2);
+    if (optimizeDistortion) {
+      total += addPrior(H, g, t, K1I, 0.15);
+      total += addPrior(H, g, t, K2I, 0.15);
+      total += addPrior(H, g, t, K3I, 0.15);
+    }
+    if (optimizePerFrame) for (let k = 0; k < N; k++) if (used.has(k)) {
+      total += addPrior(H, g, t, PFI + k, 0.25);
+      if (optimizePerFrameCenter) {
+        total += addPrior(H, g, t, PCXI + k, 0.04);
+        total += addPrior(H, g, t, PCYI + k, 0.04);
+      }
+    }
+    return { H, g, cost: total };
+  };
+
+  for (let it = 0; it < iters; it++) {
+    // Assemble normal equations from per-observation autodiff blocks. This
+    // keeps derivatives local to the cameras/lens terms each match touches and
+    // avoids materialising BA's former global Jacobian.
+    const { H, g, cost: normalCost } = buildNormal(theta);
+    c0 = normalCost;
     let applied = false;
     for (let tries = 0; tries < 7; tries++) {
       const Hd = H.map((row, i) => row.map((v, j) => (i === j ? v + lambda * (v + 1) : v)));
@@ -621,7 +742,7 @@ export function bundleAdjust(frames, gyroR, pairs, {
       const rc = residuals(cand);
       const cc = cost(rc);
       if (cc < c0 - 1e-9) {
-        theta.set(cand); r0 = rc; c0 = cc; lambda = Math.max(lambda * 0.3, 1e-9);
+        theta.set(cand); c0 = cc; lambda = Math.max(lambda * 0.3, 1e-9);
         applied = true; break;
       }
       lambda = Math.min(lambda * 5, 1e6);
@@ -630,7 +751,8 @@ export function bundleAdjust(frames, gyroR, pairs, {
   }
 
   const focal = focal0 * Math.exp(theta[FI]), outCx = cx + theta[CXI], outCy = cy + theta[CYI];
-  return { R: curR(theta), focal, linearity: linearity + theta[LI],
+  const outLinearity = Math.max(minLinearity, Math.min(maxLinearity, linearity + theta[LI]));
+  return { R: curR(theta), focal, linearity: outLinearity,
     k1: k1 + theta[K1I], k2: k2 + theta[K2I], k3: k3 + theta[K3I], cx: outCx, cy: outCy,
     cameras: Array.from({ length: N }, (_, k) => ({ focalScale: Math.exp(theta[PFI + k]), cx: outCx + theta[PCXI + k], cy: outCy + theta[PCYI + k] })), cost: c0 };
 }
