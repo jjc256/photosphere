@@ -848,7 +848,7 @@ export class PanoEngine {
       accBand(this.accLoFbo, this.mTex, 0);
     });
 
-    // ---- 4. collapse bands -> avgTex (reused), fill gaps, then poles ------
+    // ---- 4. collapse bands -> avgTex and fill only with captured imagery ---
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.avgFbo);
     this._vp(); gl.disable(gl.BLEND);
     gl.useProgram(this.pCombine2);
@@ -884,16 +884,10 @@ export class PanoEngine {
       src = src === this.avgTex ? this.mTex : this.avgTex;
     });
 
-    gl.useProgram(this.pPole);
-    gl.uniform2f(gl.getUniformLocation(this.pPole, 'uTexel'), 1 / w, 1 / h);
-    gl.uniform1i(gl.getUniformLocation(this.pPole, 'uSrc'), 0);
-    for (let i = 0; i < 3; i++) {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, src === this.avgTex ? this.mFbo : this.avgFbo);
-      this._vp(); gl.disable(gl.BLEND);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src);
-      this._quad();
-      src = src === this.avgTex ? this.mTex : this.avgTex;
-    }
+    // Do not invent a zenith or nadir from adjacent latitude rows. That old
+    // pole-fill pass made a radial flower when the user had not captured the
+    // pole; a guided pole shot (or an actual weak-frame patch) is the only
+    // geometrically honest way to close that coverage gap.
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.panoFbo);
     gl.viewport(0, 0, this.size, this.h); gl.disable(gl.BLEND);

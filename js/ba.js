@@ -472,6 +472,7 @@ export function bundleAdjust(frames, gyroR, pairs, {
   focal0, cx, cy, k1 = 0, k2 = 0, k3 = 0, linearity = 1, optimizeFocal = true,
   optimizeLens = false, optimizePerFrame = false,
   priorW = 0.05, huber = 12, iters = 40, anchor = 0,
+  normalSolver = null,
 } = {}) {
   const N = frames.length;
   const theta = new Float64Array(6 * N + 7); // rotations + shared lens + per-frame f/cx/cy
@@ -567,7 +568,9 @@ export function bundleAdjust(frames, gyroR, pairs, {
     let applied = false;
     for (let tries = 0; tries < 7; tries++) {
       const Hd = H.map((row, i) => row.map((v, j) => (i === j ? v + lambda * (v + 1) : v)));
-      const dx = solveSPD(Hd, g, P);
+      // The worker supplies a WASM preconditioned-CG implementation. Keep the
+      // local JS solver solely for Node replay and WASM-unavailable browsers.
+      const dx = normalSolver?.(Hd, g) || solveSPD(Hd, g, P);
       const cand = theta.slice();
       for (let p = 0; p < P; p++) cand[active[p]] += dx[p];
       const rc = residuals(cand);
