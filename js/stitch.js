@@ -32,7 +32,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   const gyroR = shots.map((s) => qToR(s.quat));
   const hfov = (shots[0].hfovDeg || 55) * DEG;
   const w = shots[0].w, h = shots[0].h;
-  const cx = w / 2, cy = h / 2;
+  let cx = w / 2, cy = h / 2;
   const focal0 = (w / 2) / Math.tan(hfov / 2);
   const bail = () => ({ rotations: gyroR, focalScale: 1, k1: 0, k2: 0, gains: shots.map(() => 1), connected: shots.map(() => true), ok: false, log });
 
@@ -238,7 +238,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
         priorW: 0.08, huber: 5, iters: N > 24 ? 6 : 14,
       });
       if (ba.R.every((R) => R.every((v) => isFinite(v))) && isFinite(ba.focal)) {
-        rotations = ba.R; focal = ba.focal; k1 = ba.k1; k2 = ba.k2; linearity = ba.linearity;
+        rotations = ba.R; focal = ba.focal; k1 = ba.k1; k2 = ba.k2; linearity = ba.linearity; cx = ba.cx; cy = ba.cy;
         log.push(`global BA: focal ${focal.toFixed(1)}, L ${linearity.toFixed(3)}, k1 ${k1.toFixed(3)}, k2 ${k2.toFixed(3)}`);
       }
     } catch { /* retain rotation average if the numeric solve is ill-conditioned */ }
@@ -261,7 +261,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   // Small isolated components are locally aligned but not tied to the broader
   // panorama. Render them as weak evidence so a tiny island cannot overwrite
   // a larger, coherent view at a seam.
-  return { rotations, focalScale: focal / focal0, k1, k2, linearity, gains, connected, reliable, ok: true, log };
+  return { rotations, focalScale: focal / focal0, k1, k2, linearity, cx, cy, gains, connected, reliable, ok: true, log };
 }
 
 class UnionFind {

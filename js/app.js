@@ -589,7 +589,8 @@ async function toReview() {
         weak: nReliable >= 3 && !reliable[k],
         vidRot: s.vidRot,
       }));
-      state.engine.compositeStitched(parts, tanX, tanY, result.k1 || 0, result.k2 || 0, result.linearity || 1);
+      const center = [result.cx / s0.w, result.cy / s0.h];
+      state.engine.compositeStitched(parts, tanX, tanY, result.k1 || 0, result.k2 || 0, result.linearity || 1, center);
       if (nReliable < state.shots.length) toast(`Using ${nReliable} verified frames of ${state.shots.length}`);
     } else {
       state.engine.bake(); // gyro-only fallback (from the live splat accumulation)
