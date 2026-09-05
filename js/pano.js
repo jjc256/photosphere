@@ -103,6 +103,7 @@ uniform vec2 uTan;       // tan(hfov/2), tan(vfov/2)
 uniform float uGain;
 uniform float uK1;       // radial distortion, solved by the stitcher
 uniform float uK2;
+uniform float uK3;
 uniform float uLinearity;
 uniform mat2 uVidRot;    // in-plane frame rotation
 uniform vec2 uCenter;    // calibrated principal point in source UVs
@@ -123,10 +124,11 @@ bool warp(out vec3 rgb, out float edge) {
   vec2 ideal = xy < 1e-6 ? vec2(0.0) : cam.xy * (radius / xy);
   float xu = ideal.x;
   float yu = ideal.y;
-  float r2 = xu * xu + yu * yu;
-  float sd = 1.0 + uK1 * r2 + uK2 * r2 * r2;
-  float px = (xu * sd) / uTan.x;
-  float py = (yu * sd) / uTan.y;
+  float idealRadius = length(ideal);
+  float distortedRadius = idealRadius + uK1 * idealRadius * idealRadius + uK2 * idealRadius * idealRadius * idealRadius + uK3 * idealRadius * idealRadius * idealRadius * idealRadius;
+  vec2 distorted = idealRadius < 1e-6 ? vec2(0.0) : ideal * (distortedRadius / idealRadius);
+  float px = distorted.x / uTan.x;
+  float py = distorted.y / uTan.y;
   if (max(abs(px), abs(py)) > 1.0) return false;
   vec2 rp = uVidRot * vec2(px, py);
   vec2 uv = rp * 0.5 + uCenter;
@@ -678,6 +680,7 @@ export class PanoEngine {
     gl.uniform1f(gl.getUniformLocation(prog, 'uGain'), gain);
     gl.uniform1f(gl.getUniformLocation(prog, 'uK1'), this._k1 || 0);
     gl.uniform1f(gl.getUniformLocation(prog, 'uK2'), this._k2 || 0);
+    gl.uniform1f(gl.getUniformLocation(prog, 'uK3'), this._k3 || 0);
     gl.uniform1f(gl.getUniformLocation(prog, 'uLinearity'), this._linearity || 1);
     gl.uniformMatrix2fv(gl.getUniformLocation(prog, 'uVidRot'), false, [c, s, -s, c]);
     gl.uniform2fv(gl.getUniformLocation(prog, 'uCenter'), this._center || [0.5, 0.5]);
@@ -706,10 +709,11 @@ export class PanoEngine {
 
   // frames: [{ img, R (row-major camera->world), gain, weak, vidRot }]. tanX/tanY =
   // tan(fov/2) for the focal-corrected lens. Fills panoTex.
-  compositeStitched(frames, tanX, tanY, k1 = 0, k2 = 0, linearity = 1, center = [0.5, 0.5]) {
+  compositeStitched(frames, tanX, tanY, k1 = 0, k2 = 0, k3 = 0, linearity = 1, center = [0.5, 0.5]) {
     const gl = this.gl;
     this._k1 = k1;
     this._k2 = k2;
+    this._k3 = k3;
     this._linearity = linearity;
     this._center = center;
     this._initComposite();

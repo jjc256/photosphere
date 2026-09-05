@@ -256,19 +256,6 @@ export function relRotFromHomography(H, f) {
 }
 
 // ---- lens model -----------------------------------------------------------
-// Phone lenses are not pinholes. A two-term radial model
-// x_d = x_u(1 + k1*r_u^2 + k2*r_u^4) captures the higher-order edge curvature.
-// Without this the reprojection
-// error grows toward the frame edges - which is exactly where seams land - so
-// pairs fit worse, more get rejected, and the ones that pass still misalign at
-// the seam. k1 < 0 is barrel.
-export function distortPt(x, y, k1, k2 = 0) {
-  if (!k1 && !k2) return [x, y];
-  const r2 = x * x + y * y;
-  const s = 1 + k1 * r2 + k2 * r2 * r2;
-  return [x * s, y * s];
-}
-
 let generalizedKernel = null;
 export function setGeneralizedLensKernel(kernel) { generalizedKernel = kernel; }
 const thetaToRadius = (theta, linearity) => generalizedKernel
@@ -278,8 +265,32 @@ const radiusToTheta = (radius, linearity) => generalizedKernel
   ? generalizedKernel.radius_to_theta(radius, linearity)
   : (Math.abs(linearity) < 1e-8 ? radius : Math.atan(radius * linearity) / linearity);
 
-function rayFromFilm(x, y, k1, k2, linearity) {
-  const u = undistortPt(x, y, k1, k2);
+// Panorama's PTLens polynomial is expressed on radius, not as a scale factor:
+// r_d = r + a*r^2 + b*r^3 + c*r^4.
+export function distortPt(x, y, a = 0, b = 0, c = 0) {
+  const r = Math.hypot(x, y);
+  if (r < 1e-12 || (!a && !b && !c)) return [x, y];
+  const rd = generalizedKernel ? generalizedKernel.ptlens_distort(r, a, b, c)
+    : r + a * r * r + b * r * r * r + c * r * r * r * r;
+  return [x * rd / r, y * rd / r];
+}
+
+export function undistortPt(x, y, a = 0, b = 0, c = 0) {
+  const rd = Math.hypot(x, y);
+  if (rd < 1e-12 || (!a && !b && !c)) return [x, y];
+  let r = generalizedKernel ? generalizedKernel.ptlens_undistort(rd, a, b, c) : rd;
+  if (!generalizedKernel) for (let i = 0; i < 10; i++) {
+    const r2 = r * r;
+    const value = r + a * r2 + b * r2 * r + c * r2 * r2 - rd;
+    const deriv = 1 + 2 * a * r + 3 * b * r2 + 4 * c * r2 * r;
+    if (Math.abs(deriv) < 1e-10) break;
+    r -= value / deriv;
+  }
+  return [x * r / rd, y * r / rd];
+}
+
+function rayFromFilm(x, y, k1, k2, k3, linearity) {
+  const u = undistortPt(x, y, k1, k2, k3);
   const r = Math.hypot(u[0], u[1]);
   if (r < 1e-12) return [0, 0, -1];
   const theta = radiusToTheta(r, linearity);
@@ -287,21 +298,13 @@ function rayFromFilm(x, y, k1, k2, linearity) {
   return [u[0] * s, u[1] * s, -Math.cos(theta)];
 }
 
-function filmFromRay(d, k1, k2, linearity) {
+function filmFromRay(d, k1, k2, k3, linearity) {
   const n = Math.hypot(d[0], d[1], d[2]) || 1;
   const theta = Math.acos(Math.max(-1, Math.min(1, -d[2] / n)));
   const xy = Math.hypot(d[0], d[1]);
   if (xy < 1e-12) return [0, 0];
   const r = thetaToRadius(theta, linearity);
-  return distortPt(d[0] * r / xy, d[1] * r / xy, k1, k2);
-}
-export function undistortPt(x, y, k1, k2 = 0) {
-  const rd2 = x * x + y * y;
-  if ((!k1 && !k2) || rd2 < 1e-14) return [x, y];
-  let ru2 = rd2;
-  for (let i = 0; i < 8; i++) { const s = 1 + k1 * ru2 + k2 * ru2 * ru2; ru2 = rd2 / (s * s); }
-  const s = 1 + k1 * ru2 + k2 * ru2 * ru2;
-  return [x / s, y / s];
+  return distortPt(d[0] * r / xy, d[1] * r / xy, k1, k2, k3);
 }
 
 // Gauss-Newton refine of ONE relative rotation Rrel (cam_i ray -> cam_j ray)
@@ -309,13 +312,13 @@ export function undistortPt(x, y, k1, k2 = 0) {
 // Runs LM, drops gross mismatches that slipped past homography RANSAC
 // (periodic-texture false positives), then re-runs. Returns rms/inl on the
 // surviving inlier set.
-export function refineRelRot(Rrel0, m0, f, { iters = 20, k1 = 0, k2 = 0, linearity = 1 } = {}) {
+export function refineRelRot(Rrel0, m0, f, { iters = 20, k1 = 0, k2 = 0, k3 = 0, linearity = 1 } = {}) {
   // measured pixels are distorted: lift to ideal rays, and push predictions
   // back through the lens before comparing with the measured pixel.
   const rays = new Map();
   const ray = (m) => {
     let r = rays.get(m);
-    if (!r) { r = rayFromFilm(m[0] / f, m[1] / f, k1, k2, linearity); rays.set(m, r); }
+    if (!r) { r = rayFromFilm(m[0] / f, m[1] / f, k1, k2, k3, linearity); rays.set(m, r); }
     return r;
   };
   const perErr = (R, m) => {
@@ -323,7 +326,7 @@ export function refineRelRot(Rrel0, m0, f, { iters = 20, k1 = 0, k2 = 0, lineari
     for (let k = 0; k < m.length; k++) {
       const d = matVec3(R, ray(m[k]));
       const z = Math.min(d[2], -0.05);
-      const p = filmFromRay([d[0], d[1], z], k1, k2, linearity);
+      const p = filmFromRay([d[0], d[1], z], k1, k2, k3, linearity);
       e[k] = Math.hypot(f * p[0] - m[k][2], f * p[1] - m[k][3]);
     }
     return e;
@@ -337,7 +340,7 @@ export function refineRelRot(Rrel0, m0, f, { iters = 20, k1 = 0, k2 = 0, lineari
       for (let k = 0; k < m.length; k++) {
         const d = matVec3(Rr, ray(m[k]));
         const z = Math.min(d[2], -0.05);
-        const p = filmFromRay([d[0], d[1], z], k1, k2, linearity);
+        const p = filmFromRay([d[0], d[1], z], k1, k2, k3, linearity);
         out[k * 2] = f * p[0] - m[k][2];
         out[k * 2 + 1] = f * p[1] - m[k][3];
       }
@@ -392,14 +395,14 @@ export function refineRelRot(Rrel0, m0, f, { iters = 20, k1 = 0, k2 = 0, lineari
 // wide-angle rays well enough at the frame edge, so use them only for an
 // optional focal vote and make geometric reprojection the acceptance test.
 export function ransacGeneralizedRotation(matches, f, seedR, {
-  k1 = 0, k2 = 0, linearity = 1, iters = 220, thresh = 4, seed = 0x9e3779b9,
+  k1 = 0, k2 = 0, k3 = 0, linearity = 1, iters = 220, thresh = 4, seed = 0x9e3779b9,
 } = {}) {
   if (matches.length < 12) return { Rrel: seedR, inliers: [] };
   let state = seed >>> 0;
   const rnd = () => { state = (state * 1664525 + 1013904223) >>> 0; return state; };
   const errors = (R) => matches.map((m) => {
-    const d = matVec3(R, rayFromFilm(m[0] / f, m[1] / f, k1, k2, linearity));
-    const p = filmFromRay(d, k1, k2, linearity);
+    const d = matVec3(R, rayFromFilm(m[0] / f, m[1] / f, k1, k2, k3, linearity));
+    const p = filmFromRay(d, k1, k2, k3, linearity);
     return Math.hypot(f * p[0] - m[2], f * p[1] - m[3]);
   });
   let best = { Rrel: seedR, inliers: [] };
@@ -407,14 +410,14 @@ export function ransacGeneralizedRotation(matches, f, seedR, {
     const ids = new Set();
     while (ids.size < 4) ids.add(rnd() % matches.length);
     const sample = [...ids].map((i) => matches[i]);
-    const fit = refineRelRot(seedR, sample, f, { k1, k2, linearity, iters: 7 });
+    const fit = refineRelRot(seedR, sample, f, { k1, k2, k3, linearity, iters: 7 });
     const inliers = [];
     for (const [i, e] of errors(fit.Rrel).entries()) if (e < thresh) inliers.push(i);
     if (inliers.length > best.inliers.length) best = { Rrel: fit.Rrel, inliers };
   }
   if (best.inliers.length < 12) return best;
   const refined = refineRelRot(best.Rrel, best.inliers.map((i) => matches[i]), f,
-    { k1, k2, linearity, iters: 16 });
+    { k1, k2, k3, linearity, iters: 16 });
   const finalErr = errors(refined.Rrel);
   const inliers = [];
   for (const [i, e] of finalErr.entries()) if (e < Math.max(2.2, thresh * 0.72)) inliers.push(i);
@@ -466,14 +469,14 @@ function weightedQuatAvg(list) {
 // pairs:  [{ i, j, m: [[xi,yi,xj,yj], ...] }]  verified inlier matches
 // Returns { R: [mat3], focal, cost }
 export function bundleAdjust(frames, gyroR, pairs, {
-  focal0, cx, cy, k1 = 0, k2 = 0, linearity = 1, optimizeFocal = true,
+  focal0, cx, cy, k1 = 0, k2 = 0, k3 = 0, linearity = 1, optimizeFocal = true,
   optimizeLens = false,
   priorW = 0.05, huber = 12, iters = 40, anchor = 0,
 } = {}) {
   const N = frames.length;
-  const theta = new Float64Array(3 * N + 6); // rotations + f, L, k1, k2, cx, cy
+  const theta = new Float64Array(3 * N + 7); // rotations + f, L, PTLens a/b/c, cx/cy
   const FI = 3 * N;                           // focal-scale param index
-  const LI = FI + 1, K1I = FI + 2, K2I = FI + 3, CXI = FI + 4, CYI = FI + 5;
+  const LI = FI + 1, K1I = FI + 2, K2I = FI + 3, K3I = FI + 4, CXI = FI + 5, CYI = FI + 6;
 
   // Active params: every rotation triple except the anchor frame's, + focal.
   // Fixing one frame removes the global-rotation gauge freedom so the normal
@@ -481,7 +484,7 @@ export function bundleAdjust(frames, gyroR, pairs, {
   const active = [];
   for (let k = 0; k < N; k++) if (k !== anchor) active.push(k * 3, k * 3 + 1, k * 3 + 2);
   if (optimizeFocal) active.push(FI);
-  if (optimizeLens) active.push(LI, K1I, K2I, CXI, CYI);
+  if (optimizeLens) active.push(LI, K1I, K2I, K3I, CXI, CYI);
   const P = active.length;
 
   const curR = (t) => {
@@ -494,16 +497,16 @@ export function bundleAdjust(frames, gyroR, pairs, {
     const R = curR(t);
     const f = focal0 * Math.exp(t[FI]);
     const ll = Math.max(0.2, Math.min(1.8, linearity + t[LI]));
-    const kk1 = k1 + t[K1I], kk2 = k2 + t[K2I];
+    const kk1 = k1 + t[K1I], kk2 = k2 + t[K2I], kk3 = k3 + t[K3I];
     const ccx = cx + t[CXI], ccy = cy + t[CYI];
     const res = [];
     for (const pr of pairs) {
       const Rrel = matMul3(matT3(R[pr.j]), R[pr.i]); // cam i -> world -> cam j
       for (const [xi, yi, xj, yj] of pr.m) {
-        const u = rayFromFilm((xi - ccx) / f, (yi - ccy) / f, kk1, kk2, ll);
+        const u = rayFromFilm((xi - ccx) / f, (yi - ccy) / f, kk1, kk2, kk3, ll);
         const d = matVec3(Rrel, u); // camera looks -Z
         const z = Math.min(d[2], -0.05);              // smooth clamp (no behind-camera spikes)
-        const p = filmFromRay([d[0], d[1], z], kk1, kk2, ll);
+        const p = filmFromRay([d[0], d[1], z], kk1, kk2, kk3, ll);
         let rx = ccx + f * p[0] - xj;
         let ry = ccy + f * p[1] - yj;
         const r = Math.hypot(rx, ry);
@@ -515,7 +518,7 @@ export function bundleAdjust(frames, gyroR, pairs, {
       res.push(priorW * t[k * 3], priorW * t[k * 3 + 1], priorW * t[k * 3 + 2]);
     }
     if (optimizeFocal) res.push(0.15 * t[FI]); // gentle focal prior
-    if (optimizeLens) res.push(0.2 * t[LI], 0.15 * t[K1I], 0.15 * t[K2I], 0.02 * t[CXI], 0.02 * t[CYI]);
+    if (optimizeLens) res.push(0.2 * t[LI], 0.15 * t[K1I], 0.15 * t[K2I], 0.15 * t[K3I], 0.02 * t[CXI], 0.02 * t[CYI]);
     return res;
   };
 
@@ -571,7 +574,7 @@ export function bundleAdjust(frames, gyroR, pairs, {
   }
 
   return { R: curR(theta), focal: focal0 * Math.exp(theta[FI]), linearity: linearity + theta[LI],
-    k1: k1 + theta[K1I], k2: k2 + theta[K2I], cx: cx + theta[CXI], cy: cy + theta[CYI], cost: c0 };
+    k1: k1 + theta[K1I], k2: k2 + theta[K2I], k3: k3 + theta[K3I], cx: cx + theta[CXI], cy: cy + theta[CYI], cost: c0 };
 }
 
 // ---- gain compensation ---------------------------------------------------------
