@@ -13,8 +13,9 @@
 
 import { featureBackend } from './cv-features.js';
 import { generalizedLensSolver } from './solver-wasm.js';
+import { globalBundleAdjust } from './solver-worker-client.js';
 import {
-  ransacHomography, focalFromHomography, relRotFromHomography, refineRelRot,
+  ransacHomography, focalFromHomography, ransacGeneralizedRotation, refineRelRot,
   rotationAverage, bundleAdjust, gainCompensate, qToR, matMul3, matT3, logSO3, setGeneralizedLensKernel,
 } from './ba.js';
 
@@ -53,11 +54,9 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   log.push(`features: ${counts.join(',')}`);
   log.push(`usable frames (>=60 feat): ${usable}/${N}`);
 
-  // 2. candidate pairs: IMU-adjacent (bounded fan-out) + capture neighbours.
-  // This mirrors a panorama matcher’s overlap graph while staying practical in
-  // the browser: exhaustive ORB matching across 50 full frames is too costly.
-  // (capture order tracks a sweep, and covers the case where the gyro is dead).
-  const maxAng = Math.min(hfov * 1.15, 1.4);
+  // 2. Candidate pairs. Panorama deliberately tries every pair after it has
+  // established its ordered backbone: IMU estimates are only priors and must
+  // not decide which overlaps exist.
   const seen = new Set();
   const cand = [];
   const addPair = (i, j) => {
@@ -65,19 +64,10 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     if (a === b || seen.has(a * N + b)) return;
     seen.add(a * N + b); cand.push([a, b]);
   };
-  for (let i = 0; i < N; i++) {
-    const near = [];
-    for (let j = 0; j < N; j++) if (j !== i) {
-      const a = angBetween(fwd(gyroR[i]), fwd(gyroR[j]));
-      if (a < maxAng) near.push([j, a]);
-    }
-    near.sort((p, q) => p[1] - q[1]);
-    for (const [j] of near.slice(0, 10)) addPair(i, j);
-  }
-  // capture-order neighbours: with ~15° steps and a ~46° lens, frames up to
-  // four apart still overlap, which bridges a short textureless stretch.
-  for (let i = 0; i + 1 < N; i++) {
-    for (let d = 1; d <= 4 && i + d < N; d++) addPair(i, i + d);
+  for (let i = 0; i < N; i++) for (let j = i + 1; j < N; j++) {
+    // Frames below the feature floor cannot produce a geometric edge, so skip
+    // only those. This leaves no IMU/capture-order blind spots in the graph.
+    if (counts[i] >= 12 && counts[j] >= 12) addPair(i, j);
   }
 
   // 3. match + homography verification
@@ -94,9 +84,15 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
       const pb = raw.map(([, b]) => [feats[j].kps[b].x, feats[j].kps[b].y]);
       const ca = pa.map((p) => [p[0] - cx, p[1] - cy]);
       const cb = pb.map((p) => [p[0] - cx, p[1] - cy]);
-      const { H, inliers } = ransacHomography(ca, cb, { iters: 500, thresh: 3.5 });
+      // Direct calibrated-ray RANSAC decides whether the images overlap.
+      const gyroSeed = matMul3(matT3(gyroR[j]), gyroR[i]);
+      const geometric = ransacGeneralizedRotation(ca.map((p, k) => [p[0], p[1], cb[k][0], cb[k][1]]), focal0, gyroSeed);
+      const inliers = geometric.inliers;
       bestInl = Math.max(bestInl, inliers.length);
-      if (inliers.length >= 12 && H) {
+      if (inliers.length >= 12) {
+        // Keep a homography only as a weak focal vote; it no longer controls
+        // pair acceptance or the relative-rotation seed.
+        const { H } = ransacHomography(ca, cb, { iters: 180, thresh: 4.5 });
         const step = Math.max(1, Math.floor(inliers.length / 70));
         const mc = [];
         for (let k = 0; k < inliers.length; k += step) {
@@ -109,8 +105,8 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
           si += gi[Math.round(pa[t][1]) * shots[i].w + Math.round(pa[t][0])] || 0;
           sj += gj[Math.round(pb[t][1]) * shots[j].w + Math.round(pb[t][0])] || 0;
         }
-        verified.push({ i, j, mc, inl: inliers.length, Ii: si / inliers.length / 255, Ij: sj / inliers.length / 255, H });
-        for (const f of focalFromHomography(H)) if (f > 0.3 * focal0 && f < 3 * focal0) focals.push(f);
+        verified.push({ i, j, mc, inl: inliers.length, Ii: si / inliers.length / 255, Ij: sj / inliers.length / 255, H, Rseed: geometric.Rrel });
+        if (H) for (const f of focalFromHomography(H)) if (f > 0.3 * focal0 && f < 3 * focal0) focals.push(f);
       }
     }
     await tick();
@@ -130,6 +126,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   onProgress('optimizing', 0);
   const seedFor = (v, fl) => {
     const gyroSeed = matMul3(matT3(gyroR[v.j]), gyroR[v.i]); // cam_i ray -> cam_j ray
+    if (v.Rseed) return v.Rseed;
     try {
       const hSeed = relRotFromHomography(v.H, fl);
       const off = Math.hypot(...logSO3(matMul3(hSeed, matT3(gyroSeed))));
@@ -229,32 +226,23 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     return drift < 0.5 && avg[k].every((v) => isFinite(v)) ? avg[k] : g;
   });
 
-  // 7b. Global reprojection refinement, component by component. Rotation
-  // averaging makes pair constraints consistent; bundle adjustment then moves
-  // all cameras in a component together to minimise their feature error.
-  const members = new Map();
-  root.forEach((r, i) => { if (!members.has(r)) members.set(r, []); members.get(r).push(i); });
-  let baCount = 0;
-  for (const ids of members.values()) {
-    if (ids.length < 3) continue;
-    const local = new Map(ids.map((id, k) => [id, k]));
-    const pairs = edges.filter((e) => local.has(e.i) && local.has(e.j)).map((e) => ({
-      i: local.get(e.i), j: local.get(e.j),
-      m: e.mc.map(([xi, yi, xj, yj]) => [xi + cx, yi + cy, xj + cx, yj + cy]),
-    }));
-    if (pairs.length < ids.length - 1) continue;
+  // 7b. One global reprojection solve. Isolated nodes remain anchored by their
+  // IMU priors while every verified edge shares the same lens calibration.
+  const allPairs = edges.map((e) => ({
+    i: e.i, j: e.j, m: e.mc.map(([xi, yi, xj, yj]) => [xi + cx, yi + cy, xj + cx, yj + cy]),
+  }));
+  if (allPairs.length) {
     try {
-      const ba = bundleAdjust(ids.map(() => ({ w, h })), ids.map((id) => rotations[id]), pairs, {
-        focal0: focal, cx, cy, k1, k2, linearity, optimizeFocal: false, priorW: 0.08, huber: 5, iters: ids.length > 16 ? 5 : 12,
+      const ba = await globalBundleAdjust(shots.map(() => ({ w, h })), rotations, allPairs, {
+        focal0: focal, cx, cy, k1, k2, linearity, optimizeFocal: true, optimizeLens: true,
+        priorW: 0.08, huber: 5, iters: N > 24 ? 6 : 14,
       });
-      if (ba.R.every((R) => R.every((v) => isFinite(v)))) {
-        ids.forEach((id, k) => { rotations[id] = ba.R[k]; });
-        baCount++;
+      if (ba.R.every((R) => R.every((v) => isFinite(v))) && isFinite(ba.focal)) {
+        rotations = ba.R; focal = ba.focal; k1 = ba.k1; k2 = ba.k2; linearity = ba.linearity;
+        log.push(`global BA: focal ${focal.toFixed(1)}, L ${linearity.toFixed(3)}, k1 ${k1.toFixed(3)}, k2 ${k2.toFixed(3)}`);
       }
-    } catch { /* keep the rotation-average result for this component */ }
-    await tick();
+    } catch { /* retain rotation average if the numeric solve is ill-conditioned */ }
   }
-  if (baCount) log.push(`bundle-adjusted ${baCount} match component${baCount === 1 ? '' : 's'}`);
   onProgress('optimizing', 1);
 
   // 8. gain compensation over every matched pair
