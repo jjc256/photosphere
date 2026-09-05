@@ -8,7 +8,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.13.0';
+const APP_VERSION = '0.14.0';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -587,7 +587,7 @@ async function toReview() {
       const parts = state.shots.map((s, k) => ({
         img: s.imgData, R: result.rotations[k], gain: result.gains[k],
         weak: nReliable >= 3 && !reliable[k],
-        vidRot: s.vidRot,
+        vidRot: s.vidRot, camera: result.cameras?.[k],
       }));
       const center = [result.cx / s0.w, result.cy / s0.h];
       state.engine.compositeStitched(parts, tanX, tanY, result.k1 || 0, result.k2 || 0, result.k3 || 0, result.linearity || 1, center);

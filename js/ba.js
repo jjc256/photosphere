@@ -470,13 +470,14 @@ function weightedQuatAvg(list) {
 // Returns { R: [mat3], focal, cost }
 export function bundleAdjust(frames, gyroR, pairs, {
   focal0, cx, cy, k1 = 0, k2 = 0, k3 = 0, linearity = 1, optimizeFocal = true,
-  optimizeLens = false,
+  optimizeLens = false, optimizePerFrame = false,
   priorW = 0.05, huber = 12, iters = 40, anchor = 0,
 } = {}) {
   const N = frames.length;
-  const theta = new Float64Array(3 * N + 7); // rotations + f, L, PTLens a/b/c, cx/cy
+  const theta = new Float64Array(6 * N + 7); // rotations + shared lens + per-frame f/cx/cy
   const FI = 3 * N;                           // focal-scale param index
   const LI = FI + 1, K1I = FI + 2, K2I = FI + 3, K3I = FI + 4, CXI = FI + 5, CYI = FI + 6;
+  const PFI = FI + 7, PCXI = PFI + N, PCYI = PCXI + N;
 
   // Active params: every rotation triple except the anchor frame's, + focal.
   // Fixing one frame removes the global-rotation gauge freedom so the normal
@@ -485,6 +486,8 @@ export function bundleAdjust(frames, gyroR, pairs, {
   for (let k = 0; k < N; k++) if (k !== anchor) active.push(k * 3, k * 3 + 1, k * 3 + 2);
   if (optimizeFocal) active.push(FI);
   if (optimizeLens) active.push(LI, K1I, K2I, K3I, CXI, CYI);
+  const used = new Set(pairs.flatMap((p) => [p.i, p.j]));
+  if (optimizePerFrame) for (let k = 0; k < N; k++) if (used.has(k)) active.push(PFI + k, PCXI + k, PCYI + k);
   const P = active.length;
 
   const curR = (t) => {
@@ -499,16 +502,18 @@ export function bundleAdjust(frames, gyroR, pairs, {
     const ll = Math.max(0.2, Math.min(1.8, linearity + t[LI]));
     const kk1 = k1 + t[K1I], kk2 = k2 + t[K2I], kk3 = k3 + t[K3I];
     const ccx = cx + t[CXI], ccy = cy + t[CYI];
+    const cam = (k) => ({ f: f * Math.exp(t[PFI + k]), cx: ccx + t[PCXI + k], cy: ccy + t[PCYI + k] });
     const res = [];
     for (const pr of pairs) {
       const Rrel = matMul3(matT3(R[pr.j]), R[pr.i]); // cam i -> world -> cam j
+      const ci = cam(pr.i), cj = cam(pr.j);
       for (const [xi, yi, xj, yj] of pr.m) {
-        const u = rayFromFilm((xi - ccx) / f, (yi - ccy) / f, kk1, kk2, kk3, ll);
+        const u = rayFromFilm((xi - ci.cx) / ci.f, (yi - ci.cy) / ci.f, kk1, kk2, kk3, ll);
         const d = matVec3(Rrel, u); // camera looks -Z
         const z = Math.min(d[2], -0.05);              // smooth clamp (no behind-camera spikes)
         const p = filmFromRay([d[0], d[1], z], kk1, kk2, kk3, ll);
-        let rx = ccx + f * p[0] - xj;
-        let ry = ccy + f * p[1] - yj;
+        let rx = cj.cx + cj.f * p[0] - xj;
+        let ry = cj.cy + cj.f * p[1] - yj;
         const r = Math.hypot(rx, ry);
         if (r > huber) { const s = Math.sqrt(huber / r); rx *= s; ry *= s; }
         res.push(rx, ry);
@@ -519,6 +524,9 @@ export function bundleAdjust(frames, gyroR, pairs, {
     }
     if (optimizeFocal) res.push(0.15 * t[FI]); // gentle focal prior
     if (optimizeLens) res.push(0.2 * t[LI], 0.15 * t[K1I], 0.15 * t[K2I], 0.15 * t[K3I], 0.02 * t[CXI], 0.02 * t[CYI]);
+    if (optimizePerFrame) for (let k = 0; k < N; k++) if (used.has(k)) {
+      res.push(0.25 * t[PFI + k], 0.04 * t[PCXI + k], 0.04 * t[PCYI + k]);
+    }
     return res;
   };
 
@@ -573,8 +581,10 @@ export function bundleAdjust(frames, gyroR, pairs, {
     if (!applied) break;
   }
 
-  return { R: curR(theta), focal: focal0 * Math.exp(theta[FI]), linearity: linearity + theta[LI],
-    k1: k1 + theta[K1I], k2: k2 + theta[K2I], k3: k3 + theta[K3I], cx: cx + theta[CXI], cy: cy + theta[CYI], cost: c0 };
+  const focal = focal0 * Math.exp(theta[FI]), outCx = cx + theta[CXI], outCy = cy + theta[CYI];
+  return { R: curR(theta), focal, linearity: linearity + theta[LI],
+    k1: k1 + theta[K1I], k2: k2 + theta[K2I], k3: k3 + theta[K3I], cx: outCx, cy: outCy,
+    cameras: Array.from({ length: N }, (_, k) => ({ focalScale: Math.exp(theta[PFI + k]), cx: outCx + theta[PCXI + k], cy: outCy + theta[PCYI + k] })), cost: c0 };
 }
 
 // ---- gain compensation ---------------------------------------------------------

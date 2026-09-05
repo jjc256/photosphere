@@ -671,19 +671,21 @@ export class PanoEngine {
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
   }
 
-  _warpUniforms(prog, uRot, tanX, tanY, gain, vidRot = 0) {
+  _warpUniforms(prog, uRot, tanX, tanY, gain, vidRot = 0, camera = null, image = null) {
     const gl = this.gl;
     const a = (vidRot % 4) * Math.PI / 2;
     const c = Math.cos(a), s = Math.sin(a);
     gl.uniformMatrix3fv(gl.getUniformLocation(prog, 'uRot'), false, uRot);
-    gl.uniform2f(gl.getUniformLocation(prog, 'uTan'), tanX, tanY);
+    const focalScale = camera?.focalScale || 1;
+    gl.uniform2f(gl.getUniformLocation(prog, 'uTan'), tanX / focalScale, tanY / focalScale);
     gl.uniform1f(gl.getUniformLocation(prog, 'uGain'), gain);
     gl.uniform1f(gl.getUniformLocation(prog, 'uK1'), this._k1 || 0);
     gl.uniform1f(gl.getUniformLocation(prog, 'uK2'), this._k2 || 0);
     gl.uniform1f(gl.getUniformLocation(prog, 'uK3'), this._k3 || 0);
     gl.uniform1f(gl.getUniformLocation(prog, 'uLinearity'), this._linearity || 1);
     gl.uniformMatrix2fv(gl.getUniformLocation(prog, 'uVidRot'), false, [c, s, -s, c]);
-    gl.uniform2fv(gl.getUniformLocation(prog, 'uCenter'), this._center || [0.5, 0.5]);
+    const center = camera && image ? [camera.cx / image.width, camera.cy / image.height] : this._center || [0.5, 0.5];
+    gl.uniform2fv(gl.getUniformLocation(prog, 'uCenter'), center);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
     gl.uniform1i(gl.getUniformLocation(prog, 'uFrame'), 0);
@@ -728,7 +730,8 @@ export class PanoEngine {
     const warpTo = (prog, fbo, k) => {
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
       this._vp();
-      this._warpUniforms(prog, rots[k], tanX, tanY, blendFrames[k].gain || 1, blendFrames[k].vidRot || 0);
+      const frame = blendFrames[k];
+      this._warpUniforms(prog, rots[k], tanX, tanY, frame.gain || 1, frame.vidRot || 0, frame.camera, frame.img);
     };
 
     // ---- 1. consensus mosaic (feather average) -> avgTex ----------------
@@ -865,7 +868,7 @@ export class PanoEngine {
       this._vp();
       gl.useProgram(this.pWarpC);
       this._warpUniforms(this.pWarpC, matT3col(fr.R), tanX, tanY,
-        fr.gain || 1, fr.vidRot || 0);
+        fr.gain || 1, fr.vidRot || 0, fr.camera, fr.img);
       gl.disable(gl.BLEND); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
       this._quad();
 

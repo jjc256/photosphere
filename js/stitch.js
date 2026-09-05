@@ -233,6 +233,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     const drift = Math.hypot(...logSO3(matMul3(avg[k], matT3(g))));
     return drift < 0.5 && avg[k].every((v) => isFinite(v)) ? avg[k] : g;
   });
+  let cameras = shots.map(() => ({ focalScale: 1, cx, cy }));
 
   // 7b. One global reprojection solve. Isolated nodes remain anchored by their
   // IMU priors while every verified edge shares the same lens calibration.
@@ -242,11 +243,11 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   if (allPairs.length) {
     try {
       const ba = await globalBundleAdjust(shots.map(() => ({ w, h })), rotations, allPairs, {
-        focal0: focal, cx, cy, k1, k2, k3, linearity, optimizeFocal: true, optimizeLens: true,
-        priorW: 0.08, huber: 5, iters: N > 24 ? 6 : 14,
+        focal0: focal, cx, cy, k1, k2, k3, linearity, optimizeFocal: true, optimizeLens: true, optimizePerFrame: true,
+        priorW: 0.08, huber: 5, iters: N > 24 ? 4 : 10,
       });
       if (ba.R.every((R) => R.every((v) => isFinite(v))) && isFinite(ba.focal)) {
-        rotations = ba.R; focal = ba.focal; k1 = ba.k1; k2 = ba.k2; k3 = ba.k3; linearity = ba.linearity; cx = ba.cx; cy = ba.cy;
+        rotations = ba.R; focal = ba.focal; k1 = ba.k1; k2 = ba.k2; k3 = ba.k3; linearity = ba.linearity; cx = ba.cx; cy = ba.cy; cameras = ba.cameras;
         log.push(`global BA: focal ${focal.toFixed(1)}, L ${linearity.toFixed(3)}, a ${k1.toFixed(3)}, b ${k2.toFixed(3)}, c ${k3.toFixed(3)}`);
       }
     } catch { /* retain rotation average if the numeric solve is ill-conditioned */ }
@@ -269,7 +270,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   // Small isolated components are locally aligned but not tied to the broader
   // panorama. Render them as weak evidence so a tiny island cannot overwrite
   // a larger, coherent view at a seam.
-  return { rotations, focalScale: focal / focal0, k1, k2, k3, linearity, cx, cy, gains, connected, reliable, ok: true, log };
+  return { rotations, focalScale: focal / focal0, k1, k2, k3, linearity, cx, cy, cameras, gains, connected, reliable, ok: true, log };
 }
 
 class UnionFind {
