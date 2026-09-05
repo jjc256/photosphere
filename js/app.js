@@ -8,7 +8,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.10.0';
+const APP_VERSION = '0.10.1';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -194,7 +194,7 @@ function sharpness(gray, w, h) {
   return n ? sum / n : 0;
 }
 
-function stashShot(manual) {
+function stashShot(manual, cap = null) {
   const vw = video.videoWidth, vh = video.videoHeight;
   if (!vw) return;
   const sm = grabFrame(GRAY_LONG, vw, vh);
@@ -213,7 +213,7 @@ function stashShot(manual) {
   state.shots.push({
     imgData: big.data, w: big.w, h: big.h,
     gray, gw: sm.w, gh: sm.h, sharp, feat,
-    speed: state.speed, t: Math.round(performance.now()),
+    speed: state.speed, t: Math.round(performance.now()), cap,
     quat: state.quat.slice(), hfovDeg: state.hfovDeg, vidRot: state.vidRot,
   });
   if (state.shots.length > MAX_SHOTS) {
@@ -223,7 +223,13 @@ function stashShot(manual) {
     for (let i = 0; i < state.shots.length; i++) {
       for (let j = i + 1; j < state.shots.length; j++) {
         const a = quatAngle(state.shots[i].quat, state.shots[j].quat);
-        if (a < bd) { bd = a; bi = state.shots[i].feat <= state.shots[j].feat ? i : j; }
+        if (a < bd) {
+          bd = a;
+          const si = state.shots[i], sj = state.shots[j];
+          // Zenith/nadir captures may have little texture, but are the only
+          // real pixels at the poles. Retain them before regular overlap shots.
+          bi = si.cap && !sj.cap ? j : (!si.cap && sj.cap ? i : (si.feat <= sj.feat ? i : j));
+        }
       }
     }
     state.shots.splice(bi, 1);
@@ -231,7 +237,7 @@ function stashShot(manual) {
   return true;
 }
 
-function doCapture(manual) {
+function doCapture(manual, target = null) {
   if (!video.videoWidth) return false;
   updateOrientation(); // capture against the freshest pose
   const { tanX, tanY } = fovTangents();
@@ -242,7 +248,7 @@ function doCapture(manual) {
   // blurrier because the sweep ran on between grabs.
   state.lastCapQuat = state.quat;
   state._lastGrabT = performance.now();
-  const ok = stashShot(manual);                                   // for the real stitch on Done
+  const ok = stashShot(manual, target?.cap || null);              // for the real stitch on Done
   if (!ok) return false;
   state.engine.splat(video, state.R, tanX, tanY, state.vidRot);   // live guide preview
   const s = $('btn-shutter');
@@ -257,7 +263,8 @@ function doCapture(manual) {
 // A lattice of dots on the sphere, spaced ~60% of the field of view so
 // neighbouring shots overlap enough to stitch. Sized to the current FOV.
 function buildTargets() {
-  // Three rings, no pole caps (the caps are filled in software). Dots sit
+  // Three overlap rings plus explicit cap captures. The latter prevent the
+  // equirectangular pole fill from inventing radial streaks at zenith/nadir.
   // ~30° apart, which is ~35% overlap on the ~46° lens these phones actually
   // have — the earlier 45° spacing left adjacent shots barely touching, which
   // is why the match graph kept fragmenting.
@@ -274,6 +281,10 @@ function buildTargets() {
       T.push({ dir: [cp * Math.sin(y), Math.sin(p), -cp * Math.cos(y)], done: false, progress: 0 });
     }
   });
+  T.push(
+    { dir: [0, 1, 0], cap: 'zenith', done: false, progress: 0 },
+    { dir: [0, -1, 0], cap: 'nadir', done: false, progress: 0 },
+  );
   state.targets = T;
   state.activeTarget = -1;
 }
@@ -362,7 +373,7 @@ function updateGuidance(now) {
     const on = i === act && t._ang < CONE && steady;
     t.progress = clamp(t.progress + (on ? dt / FILL : -dt / 0.3), 0, 1);
     if (t.progress >= 1 && on) {
-      doCapture(true);              // deliberate: never rejected
+      doCapture(true, t);           // deliberate: never rejected
       t.done = true; t.progress = 1; grabbed = true;
     }
   }

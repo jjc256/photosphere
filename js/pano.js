@@ -252,6 +252,21 @@ void main() {
   frag = vec4(clamp(c, 0.0, 1.0), 1.0);
 }`;
 
+// Fill only genuinely uncovered output pixels from gyro-positioned frames.
+// These frames are deliberately excluded from seam selection: a weak image can
+// close a hole, but must never replace feature-aligned imagery.
+const HOLEFILL_FRAG = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 frag;
+uniform sampler2D uBase;
+uniform sampler2D uFill;
+void main() {
+  vec4 base = texture(uBase, vUv);
+  if (base.a > 0.5) { frag = base; return; }
+  frag = texture(uFill, vUv);
+}`;
+
 // Normalise the accum buffer; alpha carries coverage (1 = real imagery).
 const NORMALIZE2_FRAG = `#version 300 es
 precision highp float;
@@ -361,6 +376,7 @@ export class PanoEngine {
     this.pBlur = program(gl, BLUR_FRAG);
     this.pNorm2 = program(gl, NORMALIZE2_FRAG);
     this.pCombine2 = program(gl, COMBINE2_FRAG);
+    this.pHole = program(gl, HOLEFILL_FRAG);
     this.pPole = program(gl, POLEFILL_FRAG);
     this.pBlit = program(gl, BLIT_FRAG);
     this._composited = false;
@@ -689,6 +705,7 @@ export class PanoEngine {
     // leave those uncertain areas empty instead of introducing ghost fragments.
     const aligned = frames.filter((f) => !f.weak);
     const blendFrames = aligned.length >= 2 ? aligned : frames;
+    const weakFrames = aligned.length >= 2 ? frames.filter((f) => f.weak) : [];
     const rots = blendFrames.map((f) => matT3col(f.R));
     const warpTo = (prog, fbo, k) => {
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
@@ -810,7 +827,7 @@ export class PanoEngine {
       accBand(this.accLoFbo, this.mTex, 0);
     });
 
-    // ---- 4. collapse bands -> avgTex (reused), fill caps, upscale --------
+    // ---- 4. collapse bands -> avgTex (reused), fill gaps, then poles ------
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.avgFbo);
     this._vp(); gl.disable(gl.BLEND);
     gl.useProgram(this.pCombine2);
@@ -820,10 +837,35 @@ export class PanoEngine {
     gl.uniform1i(gl.getUniformLocation(this.pCombine2, 'uLo'), 1);
     this._quad();
 
+    // A low-texture cap may not make the feature graph, but it is still more
+    // truthful than synthesising a pole. Use weak frames strictly as holes-only
+    // patches after the aligned panorama has been finalised.
+    let src = this.avgTex;
+    weakFrames.forEach((fr) => {
+      this._uploadFrame(fr.img);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.wFbo);
+      this._vp();
+      gl.useProgram(this.pWarpC);
+      this._warpUniforms(this.pWarpC, matT3col(fr.R), tanX, tanY,
+        fr.gain || 1, fr.vidRot || 0);
+      gl.disable(gl.BLEND); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+      this._quad();
+
+      const dstFbo = src === this.avgTex ? this.mFbo : this.avgFbo;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, dstFbo);
+      this._vp(); gl.disable(gl.BLEND);
+      gl.useProgram(this.pHole);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src);
+      gl.uniform1i(gl.getUniformLocation(this.pHole, 'uBase'), 0);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.wTex);
+      gl.uniform1i(gl.getUniformLocation(this.pHole, 'uFill'), 1);
+      this._quad();
+      src = src === this.avgTex ? this.mTex : this.avgTex;
+    });
+
     gl.useProgram(this.pPole);
     gl.uniform2f(gl.getUniformLocation(this.pPole, 'uTexel'), 1 / w, 1 / h);
     gl.uniform1i(gl.getUniformLocation(this.pPole, 'uSrc'), 0);
-    let src = this.avgTex;
     for (let i = 0; i < 3; i++) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, src === this.avgTex ? this.mFbo : this.avgFbo);
       this._vp(); gl.disable(gl.BLEND);
