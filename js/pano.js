@@ -103,6 +103,7 @@ uniform vec2 uTan;       // tan(hfov/2), tan(vfov/2)
 uniform float uGain;
 uniform float uK1;       // radial distortion, solved by the stitcher
 uniform float uK2;
+uniform float uLinearity;
 uniform mat2 uVidRot;    // in-plane frame rotation
 uniform sampler2D uFrame;
 const float PI = 3.14159265359;
@@ -115,8 +116,12 @@ bool warp(out vec3 rgb, out float edge) {
   if (cam.z > -1e-4) return false;
   // ideal pinhole coords, then push them back through the solved lens so we
   // sample where the ray actually landed on the sensor
-  float xu = cam.x / -cam.z;
-  float yu = cam.y / -cam.z;
+  float xy = length(cam.xy);
+  float theta = acos(clamp(-cam.z / length(cam), -1.0, 1.0));
+  float radius = abs(uLinearity) < 1e-5 ? theta : tan(theta * uLinearity) / uLinearity;
+  vec2 ideal = xy < 1e-6 ? vec2(0.0) : cam.xy * (radius / xy);
+  float xu = ideal.x;
+  float yu = ideal.y;
   float r2 = xu * xu + yu * yu;
   float sd = 1.0 + uK1 * r2 + uK2 * r2 * r2;
   float px = (xu * sd) / uTan.x;
@@ -672,6 +677,7 @@ export class PanoEngine {
     gl.uniform1f(gl.getUniformLocation(prog, 'uGain'), gain);
     gl.uniform1f(gl.getUniformLocation(prog, 'uK1'), this._k1 || 0);
     gl.uniform1f(gl.getUniformLocation(prog, 'uK2'), this._k2 || 0);
+    gl.uniform1f(gl.getUniformLocation(prog, 'uLinearity'), this._linearity || 1);
     gl.uniformMatrix2fv(gl.getUniformLocation(prog, 'uVidRot'), false, [c, s, -s, c]);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
@@ -698,10 +704,11 @@ export class PanoEngine {
 
   // frames: [{ img, R (row-major camera->world), gain, weak, vidRot }]. tanX/tanY =
   // tan(fov/2) for the focal-corrected lens. Fills panoTex.
-  compositeStitched(frames, tanX, tanY, k1 = 0, k2 = 0) {
+  compositeStitched(frames, tanX, tanY, k1 = 0, k2 = 0, linearity = 1) {
     const gl = this.gl;
     this._k1 = k1;
     this._k2 = k2;
+    this._linearity = linearity;
     this._initComposite();
     const w = this.cs, h = this.csh;
     // A gyro-only frame may be close enough to cover a hole, but it must not

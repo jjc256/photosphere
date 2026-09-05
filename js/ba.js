@@ -268,6 +268,33 @@ export function distortPt(x, y, k1, k2 = 0) {
   const s = 1 + k1 * r2 + k2 * r2 * r2;
   return [x * s, y * s];
 }
+
+let generalizedKernel = null;
+export function setGeneralizedLensKernel(kernel) { generalizedKernel = kernel; }
+const thetaToRadius = (theta, linearity) => generalizedKernel
+  ? generalizedKernel.theta_to_radius(theta, linearity)
+  : (Math.abs(linearity) < 1e-8 ? theta : Math.tan(theta * linearity) / linearity);
+const radiusToTheta = (radius, linearity) => generalizedKernel
+  ? generalizedKernel.radius_to_theta(radius, linearity)
+  : (Math.abs(linearity) < 1e-8 ? radius : Math.atan(radius * linearity) / linearity);
+
+function rayFromFilm(x, y, k1, k2, linearity) {
+  const u = undistortPt(x, y, k1, k2);
+  const r = Math.hypot(u[0], u[1]);
+  if (r < 1e-12) return [0, 0, -1];
+  const theta = radiusToTheta(r, linearity);
+  const s = Math.sin(theta) / r;
+  return [u[0] * s, u[1] * s, -Math.cos(theta)];
+}
+
+function filmFromRay(d, k1, k2, linearity) {
+  const n = Math.hypot(d[0], d[1], d[2]) || 1;
+  const theta = Math.acos(Math.max(-1, Math.min(1, -d[2] / n)));
+  const xy = Math.hypot(d[0], d[1]);
+  if (xy < 1e-12) return [0, 0];
+  const r = thetaToRadius(theta, linearity);
+  return distortPt(d[0] * r / xy, d[1] * r / xy, k1, k2);
+}
 export function undistortPt(x, y, k1, k2 = 0) {
   const rd2 = x * x + y * y;
   if ((!k1 && !k2) || rd2 < 1e-14) return [x, y];
@@ -282,13 +309,13 @@ export function undistortPt(x, y, k1, k2 = 0) {
 // Runs LM, drops gross mismatches that slipped past homography RANSAC
 // (periodic-texture false positives), then re-runs. Returns rms/inl on the
 // surviving inlier set.
-export function refineRelRot(Rrel0, m0, f, { iters = 20, k1 = 0, k2 = 0 } = {}) {
+export function refineRelRot(Rrel0, m0, f, { iters = 20, k1 = 0, k2 = 0, linearity = 1 } = {}) {
   // measured pixels are distorted: lift to ideal rays, and push predictions
   // back through the lens before comparing with the measured pixel.
   const rays = new Map();
   const ray = (m) => {
     let r = rays.get(m);
-    if (!r) { const u = undistortPt(m[0] / f, m[1] / f, k1, k2); r = [u[0], u[1], -1]; rays.set(m, r); }
+    if (!r) { r = rayFromFilm(m[0] / f, m[1] / f, k1, k2, linearity); rays.set(m, r); }
     return r;
   };
   const perErr = (R, m) => {
@@ -296,7 +323,7 @@ export function refineRelRot(Rrel0, m0, f, { iters = 20, k1 = 0, k2 = 0 } = {}) 
     for (let k = 0; k < m.length; k++) {
       const d = matVec3(R, ray(m[k]));
       const z = Math.min(d[2], -0.05);
-      const p = distortPt(-d[0] / z, -d[1] / z, k1, k2);
+      const p = filmFromRay([d[0], d[1], z], k1, k2, linearity);
       e[k] = Math.hypot(f * p[0] - m[k][2], f * p[1] - m[k][3]);
     }
     return e;
@@ -310,7 +337,7 @@ export function refineRelRot(Rrel0, m0, f, { iters = 20, k1 = 0, k2 = 0 } = {}) 
       for (let k = 0; k < m.length; k++) {
         const d = matVec3(Rr, ray(m[k]));
         const z = Math.min(d[2], -0.05);
-        const p = distortPt(-d[0] / z, -d[1] / z, k1, k2);
+        const p = filmFromRay([d[0], d[1], z], k1, k2, linearity);
         out[k * 2] = f * p[0] - m[k][2];
         out[k * 2 + 1] = f * p[1] - m[k][3];
       }
@@ -406,7 +433,7 @@ function weightedQuatAvg(list) {
 // pairs:  [{ i, j, m: [[xi,yi,xj,yj], ...] }]  verified inlier matches
 // Returns { R: [mat3], focal, cost }
 export function bundleAdjust(frames, gyroR, pairs, {
-  focal0, cx, cy, k1 = 0, k2 = 0, optimizeFocal = true,
+  focal0, cx, cy, k1 = 0, k2 = 0, linearity = 1, optimizeFocal = true,
   priorW = 0.05, huber = 12, iters = 40, anchor = 0,
 } = {}) {
   const N = frames.length;
@@ -434,10 +461,10 @@ export function bundleAdjust(frames, gyroR, pairs, {
     for (const pr of pairs) {
       const Rrel = matMul3(matT3(R[pr.j]), R[pr.i]); // cam i -> world -> cam j
       for (const [xi, yi, xj, yj] of pr.m) {
-        const u = undistortPt((xi - cx) / f, (yi - cy) / f, k1, k2);
-        const d = matVec3(Rrel, [u[0], u[1], -1]); // camera looks -Z
+        const u = rayFromFilm((xi - cx) / f, (yi - cy) / f, k1, k2, linearity);
+        const d = matVec3(Rrel, u); // camera looks -Z
         const z = Math.min(d[2], -0.05);              // smooth clamp (no behind-camera spikes)
-        const p = distortPt(-d[0] / z, -d[1] / z, k1, k2);
+        const p = filmFromRay([d[0], d[1], z], k1, k2, linearity);
         let rx = cx + f * p[0] - xj;
         let ry = cy + f * p[1] - yj;
         const r = Math.hypot(rx, ry);
