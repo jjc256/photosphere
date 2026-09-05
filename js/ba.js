@@ -411,7 +411,7 @@ export function refineRelRot(Rrel0, m0, f, { iters = 20, k1 = 0, k2 = 0, k3 = 0,
 export function ransacGeneralizedRotation(matches, f, seedR, {
   k1 = 0, k2 = 0, k3 = 0, linearity = 1, iters = 220, thresh = 4, seed = 0x9e3779b9,
 } = {}) {
-  if (matches.length < 12) return { Rrel: seedR, inliers: [] };
+  if (matches.length < 40) return { Rrel: seedR, inliers: [] };
   let state = seed >>> 0;
   const rnd = () => { state = (state * 1664525 + 1013904223) >>> 0; return state; };
   const errors = (R) => matches.map((m) => {
@@ -432,7 +432,7 @@ export function ransacGeneralizedRotation(matches, f, seedR, {
     for (const [i, e] of errors(fit.Rrel).entries()) if (e < thresh) inliers.push(i);
     if (inliers.length > best.inliers.length) best = { Rrel: fit.Rrel, inliers };
   }
-  if (best.inliers.length < 12) return best;
+  if (best.inliers.length < 25) return best;
   const refined = refineRelRot(best.Rrel, best.inliers.map((i) => matches[i]), f,
     { k1, k2, k3, linearity, iters: 16 });
   const finalErr = errors(refined.Rrel);

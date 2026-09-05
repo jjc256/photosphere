@@ -84,7 +84,10 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     const [i, j] = cand[c];
     const raw = vision.match(feats[i], feats[j]);
     bestRaw = Math.max(bestRaw, raw.length);
-    if (raw.length >= 10) {
+    // Panorama's PairAlignment refuses underspecified descriptor sets before
+    // RANSAC (40 raw matches, then at least 25 coarse inliers).  The lower
+    // browser thresholds admitted weak texture as geometry and produced cuts.
+    if (raw.length >= 40) {
       const pa = raw.map(([a]) => [feats[i].kps[a].x, feats[i].kps[a].y]);
       const pb = raw.map(([, b]) => [feats[j].kps[b].x, feats[j].kps[b].y]);
       const ca = pa.map((p) => [(p[0] - outCx) / coordinateScale, (p[1] - outCy) / coordinateScale]);
@@ -95,7 +98,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
         { thresh: 4 / coordinateScale });
       const inliers = geometric.inliers;
       bestInl = Math.max(bestInl, inliers.length);
-      if (inliers.length >= 12) {
+      if (inliers.length >= 25) {
         // Keep a homography only as a weak focal vote; it no longer controls
         // pair acceptance or the relative-rotation seed.
         const { H } = ransacHomography(ca, cb, { iters: 180, thresh: 4.5 / coordinateScale });
