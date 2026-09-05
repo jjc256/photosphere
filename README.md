@@ -71,7 +71,7 @@ the rare browser that hands the camera feed sideways.
 | `js/orientation.js` | Turns iOS `deviceorientation` (`alpha/beta/gamma` + screen angle) into a camera→world rotation matrix (three.js `DeviceOrientationControls` math). |
 | `js/cv-features.js` + `js/vendor/opencv.js` | On-device **OpenCV WebAssembly** vision backend, custom-built with SIFT enabled and SIMD. It uses SIFT descriptors with BF L2 nearest-neighbor ratio filtering; the prior compact JavaScript ORB implementation remains only as an offline/runtime fallback. |
 | `solver/` + `js/ba.js` | Rust WebAssembly generalized-camera kernel (Gennery projection) plus geometry back-end: direct generalized-camera RANSAC, all-pairs overlap discovery, calibrated shared focal/principal-point/generalized projection (`L`)/three-coefficient PTLens radial model, regularized per-frame focal/principal-point correction, global pose-and-lens bundle adjustment, and gain compensation. `js/solver-worker.js` runs the global solve off the UI thread. |
-| `js/stitch.js` | Runs once on **Done**: OpenCV-WASM features → overlap-graph matching → RANSAC-verify → median focal → **calibrate the lens** (solve k₁ and polish the focal by minimising total pairwise reprojection error) → refine each pair's rotation → rotation-average → component bundle adjustment → gain-compensate. Frames without a coherent support group are kept out of the seam blend. |
+| `js/stitch.js` | Runs once on **Done**: OpenCV-WASM features → overlap-graph matching → RANSAC-verify → median focal → **calibrate the lens** (solve k₁ and polish the focal by minimising total pairwise reprojection error) → refine each pair's rotation → rotation-average → component bundle adjustment → gain-compensate. Separate feature groups are rigidly placed using the IMU; sensor-only frames retain coverage at lower seam priority. |
 | `js/pano.js` | WebGL2 engine. `splat()` drives the live capture preview. `compositeStitched()` runs the standard stitcher compositing chain: warp every frame to the sphere → build a consensus mosaic → **content-aware seam labels** (border distance minus a blurred photometric-disagreement term, a cheap stand-in for Kwatra graph-cut seams, resolved with the depth buffer) → **Burt–Adelson multi-band blend** (each source's detail band weighted by its mask blurred narrowly, its base band by the same mask blurred widely) → upscale to `panoTex`. Also the interactive sphere view and equirect read-back for export. |
 | `js/xmp.js` | Builds the GPano XMP packet and splices metadata segments into the JPEG (EXIF then XMP, after `APP0`). |
 | `js/exif.js` | Hand-rolled big-endian **EXIF `APP1`** writer — GPS position, capture time, view direction — the tags Google Maps / Street View needs. |
@@ -82,8 +82,9 @@ Stitching is **feature-based, seeded by the IMU**. SIFT matches (or ORB when
 OpenCV is unavailable) establish image overlaps. Robust pair alignment and
 incremental bundle adjustment refine camera poses and lens calibration. Feature
 coordinates and the WebGL renderer share right/up/−Z camera axes, including the
-frame-rotation correction. Only the largest verified component enters the final
-blend. If no pairs can be verified, the app explicitly falls back to its gyro
+frame-rotation correction. The largest verified component takes priority in the final blend. Other
+components are placed in its sensor reference, and unmatched frames retain their
+captured coverage at lower seam priority. If no pairs can be verified, the app explicitly falls back to its gyro
 preview.
 
 Shoot from **one spot**, rotating around the lens. Translation and nearby objects
@@ -165,10 +166,17 @@ feature-to-pose checks with real top-down image rows, pitch, roll and a rotated
 video feed. The test checks relative rotations as well as absolute gyro anchoring.
 Open <http://localhost:8080/selftest-browser.html> with the development server
 running to verify the actual WebGL warp against known source coordinates across
-four frame rotations and four projection models, plus the browser SIFT backend.
+four frame rotations and four projection models, radial-fold rejection, a
+continuous wide blur, complete 360° coverage, and the browser SIFT backend.
+`FULL_SPHERE=1 node selftest.mjs` checks a complete 24-frame sweep;
+`node selftest-components.mjs` checks component anchoring and radial bounds.
 
 Feature pixels are converted to right/up camera axes before alignment. Calibration
 uses normalized film units; the renderer converts principal points to source UVs
-and applies distortion at each frame's calibrated focal length. Only the largest
-verified component contributes to the final stitch; unmatched areas remain empty
-rather than being patched with unrelated gyro-aligned fragments.
+and applies distortion at each frame's calibrated focal length, bounded to the
+first monotonic radial branch. Captured frames are retained even when feature
+matching cannot link the entire sphere. Verified frames take seam precedence;
+secondary groups and motion-only frames provide lower-confidence coverage. The
+blend uses adjacent-pixel Gaussian kernels on a float texture pyramid, preventing
+repeated stripes and quantized lines near coverage borders. The debug download
+remains available after every stitch, including apparently successful ones.

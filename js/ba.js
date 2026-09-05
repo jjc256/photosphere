@@ -132,6 +132,48 @@ export const matVec3 = (A, v) => [
   madd3(A[6], v[0], A[7], v[1], A[8], v[2]),
 ];
 
+// A feature component has its own arbitrary global rotation. Keep the main
+// component fixed and place the other components in that same sensor frame,
+// using one rigid correction per component (never breaking internal alignment).
+export function anchorComponents(rotations, gyroR, components, mainRoot) {
+  const groups = new Map();
+  components.forEach((root, i) => {
+    const key = String(root);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(i);
+  });
+  const distance = (a, b) => 2 * Math.acos(Math.min(1, Math.abs(a.reduce((s, x, i) => s + x * b[i], 0))));
+  const alignment = (indices) => {
+    const qs = indices.map((i) => rToQ(matMul3(gyroR[i], matT3(rotations[i]))));
+    // Medoid plus a robust cutoff prevents one bad sensor reading from
+    // rotating an otherwise coherent component away from the captured scene.
+    const seed = qs.reduce((best, q) => {
+      const cost = qs.reduce((sum, p) => sum + distance(p, q), 0);
+      return cost < best.cost ? { q, cost } : best;
+    }, { q: qs[0], cost: Infinity }).q;
+    const errors = qs.map((q) => distance(q, seed)).sort((a, b) => a - b);
+    const cutoff = Math.max(5 * Math.PI / 180, 3 * errors[errors.length >> 1]);
+    const sum = [0, 0, 0, 0];
+    for (const q of qs) {
+      if (distance(q, seed) > cutoff) continue;
+      const sign = q.reduce((s, x, i) => s + x * seed[i], 0) < 0 ? -1 : 1;
+      q.forEach((v, i) => { sum[i] += v * sign; });
+    }
+    const norm = Math.hypot(...sum);
+    return qToR(sum.map((v) => v / norm));
+  };
+  const primary = String(mainRoot);
+  if (!groups.has(primary)) return rotations.map((R) => R.slice());
+  const sensorToMain = matT3(alignment(groups.get(primary)));
+  const output = rotations.map((R) => R.slice());
+  for (const [key, indices] of groups) {
+    if (key === primary) continue;
+    const correction = matMul3(sensorToMain, alignment(indices));
+    for (const i of indices) output[i] = matMul3(correction, rotations[i]);
+  }
+  return output;
+}
+
 // ---- homography RANSAC (pair inlier check) --------------------------------
 // Smallest-eigenvalue eigenvector of a symmetric n×n matrix via cyclic Jacobi.
 function smallestEigenvector(M, n) {

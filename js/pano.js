@@ -1,3 +1,5 @@
+import { projectionRadiusLimit } from './camera-geometry.js';
+
 // WebGL2 equirectangular panorama engine.
 //
 //  splat()   – project the current camera frame onto a float accumulation
@@ -105,6 +107,7 @@ uniform float uK1;       // radial distortion, solved by the stitcher
 uniform float uK2;
 uniform float uK3;
 uniform float uLinearity;
+uniform float uMaxRadius; // first monotonic radial branch, bounded by source corners
 uniform mat2 uVidRot;    // in-plane frame rotation
 uniform vec2 uCenter;    // calibrated principal point in source UVs
 uniform sampler2D uFrame;
@@ -129,6 +132,7 @@ bool warp(out vec3 rgb, out float edge) {
   float xu = ideal.x;
   float yu = ideal.y;
   float idealRadius = length(ideal);
+  if (idealRadius > uMaxRadius) return false;
   float distortedRadius = idealRadius + uK1 * idealRadius * idealRadius + uK2 * idealRadius * idealRadius * idealRadius + uK3 * idealRadius * idealRadius * idealRadius * idealRadius;
   vec2 distorted = idealRadius < 1e-6 ? vec2(0.0) : ideal * (distortedRadius / idealRadius);
   float px = distorted.x / uTan.x;
@@ -154,10 +158,11 @@ void main() {
 // the seam finder measures each frame against.
 const FA_FRAG = WARP_HEAD + `
 out vec4 frag;
+uniform float uEvidence;
 void main() {
   vec3 rgb; float edge;
   if (!warp(rgb, edge)) discard;
-  float w = edge * edge + 0.02;
+  float w = (edge * edge + 0.02) * uEvidence;
   frag = vec4(rgb * w, w);
 }`;
 
@@ -182,7 +187,7 @@ void main() {
 const LABEL_FRAG = WARP_HEAD + `
 out vec4 frag;
 uniform float uIndex;
-uniform float uPriority;               // 1 for aligned frames, low for gyro-only
+uniform float uPriority;               // 2=main, 1=secondary component, 0=sensor-only
 uniform float uLambda;
 uniform sampler2D uCost;
 void main() {
@@ -190,7 +195,10 @@ void main() {
   if (!warp(rgb, edge)) discard;
   float cost = texture(uCost, vUv).r;
   float center = smoothstep(0.02, 0.45, edge);
-  float pri = clamp(center * edge - uLambda * cost, 0.0, 1.0) * uPriority;
+  float quality = clamp(center * edge - uLambda * cost, 0.0, 1.0);
+  // Disjoint depth ranges keep a motion-only image from winning ownership
+  // over any verified pixel. Narrow mask feathering softens their boundary.
+  float pri = (uPriority + 0.9 * quality) / 3.0;
   gl_FragDepth = 0.999 - pri * 0.998;    // higher priority -> smaller depth -> wins
   frag = vec4((uIndex + 1.0) / 255.0, edge, 0.0, 1.0);
 }`;
@@ -232,18 +240,20 @@ void main() {
   frag = vec4(band * m, m);
 }`;
 
-// Separable blur (13-tap gaussian, scaled by uStep).
+// Dense Gaussian kernel at the selected pyramid level. Tap spacing stays
+// one texel; widening a blur by spacing samples apart produces a comb.
 const BLUR_FRAG = `#version 300 es
 precision highp float;
 in vec2 vUv;
 out vec4 frag;
 uniform sampler2D uSrc;
 uniform vec2 uStep;
+uniform float uSigma;
 void main() {
   float wsum = 0.0;
   vec4 acc = vec4(0.0);
   for (int i = -6; i <= 6; i++) {
-    float w = exp(-float(i * i) / 18.0);
+    float w = exp(-float(i * i) / (2.0 * uSigma * uSigma));
     acc += texture(uSrc, vUv + uStep * float(i)) * w;
     wsum += w;
   }
@@ -356,7 +366,7 @@ function program(gl, fragSrc) {
 }
 
 export class PanoEngine {
-  constructor(canvas) {
+  constructor(canvas, { size = 4096 } = {}) {
     const gl = canvas.getContext('webgl2', {
       antialias: false,
       alpha: false,
@@ -374,7 +384,7 @@ export class PanoEngine {
     if (!cbf && !cbhf) throw new Error('This device cannot render to float textures.');
     this._floatLinear = !!floatLinear;
 
-    this.size = Math.min(4096, gl.getParameter(gl.MAX_TEXTURE_SIZE));
+    this.size = Math.min(size, 4096, gl.getParameter(gl.MAX_TEXTURE_SIZE));
     this.h = this.size / 2;
 
     this.pSplat = program(gl, SPLAT_FRAG);
@@ -549,7 +559,7 @@ export class PanoEngine {
     gl.disable(gl.BLEND);
     gl.useProgram(this.pCoverage);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.accumTex);
+    gl.bindTexture(gl.TEXTURE_2D, this._composited ? this.panoTex : this.accumTex);
     gl.uniform1i(gl.getUniformLocation(this.pCoverage, 'uAccum'), 0);
     this._quad();
 
@@ -642,7 +652,9 @@ export class PanoEngine {
     const gl = this.gl;
     const cs = Math.min(2048, this.size);
     this.cs = cs; this.csh = cs / 2;
-    const hf = this._floatLinear ? gl.LINEAR : gl.NEAREST;
+    // Half-float filtering is core in WebGL2; the optional float-linear
+    // extension concerns 32-bit floats. Nearest filtering here draws steps.
+    const hf = gl.LINEAR;
     const t8 = () => this._tex(cs, this.csh, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.REPEAT);
     const t16 = () => this._tex(cs, this.csh, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, hf, gl.REPEAT);
     this.frameTex = this._tex(4, 4, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, gl.CLAMP_TO_EDGE);
@@ -659,10 +671,10 @@ export class PanoEngine {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     this.avgTex = t8(); this.avgFbo = this._fbo(this.avgTex);
     this.wTex = t8(); this.wFbo = this._fbo(this.wTex);        // warped frame
-    this.wLoTex = t8(); this.wLoFbo = this._fbo(this.wLoTex);  // blurred frame
-    this.mTex = t8(); this.mFbo = this._fbo(this.mTex);        // mask / scratch
-    this.mHi = t8(); this.mHiFbo = this._fbo(this.mHi);        // mask, narrow blur
-    this.pingTex = t8(); this.pingFbo = this._fbo(this.pingTex);
+    this.wLoTex = t16(); this.wLoFbo = this._fbo(this.wLoTex);  // blurred frame
+    this.mTex = t16(); this.mFbo = this._fbo(this.mTex);        // mask / scratch
+    this.mHi = t16(); this.mHiFbo = this._fbo(this.mHi);        // mask, narrow blur
+    this.pingTex = t16(); this.pingFbo = this._fbo(this.pingTex);
     this._compReady = true;
   }
 
@@ -681,39 +693,75 @@ export class PanoEngine {
     const c = Math.cos(a), s = Math.sin(a);
     gl.uniformMatrix3fv(gl.getUniformLocation(prog, 'uRot'), false, uRot);
     const focalScale = camera?.focalScale || 1;
-    gl.uniform2f(gl.getUniformLocation(prog, 'uTan'), (camera?.tan?.[0] ?? tanX) / focalScale, (camera?.tan?.[1] ?? tanY) / focalScale);
+    const tx = (camera?.tan?.[0] ?? tanX) / focalScale;
+    const ty = (camera?.tan?.[1] ?? tanY) / focalScale;
+    const a1 = (this._k1 || 0) * focalScale;
+    const a2 = (this._k2 || 0) * focalScale ** 2;
+    const a3 = (this._k3 || 0) * focalScale ** 3;
+    const center = camera?.center || this._center || [0.5, 0.5];
+    gl.uniform2f(gl.getUniformLocation(prog, 'uTan'), tx, ty);
+    gl.uniform1f(gl.getUniformLocation(prog, 'uMaxRadius'), projectionRadiusLimit(tx, ty, center, vidRot, a1, a2, a3));
     gl.uniform1f(gl.getUniformLocation(prog, 'uGain'), gain);
-    gl.uniform1f(gl.getUniformLocation(prog, 'uK1'), (this._k1 || 0) * focalScale);
-    gl.uniform1f(gl.getUniformLocation(prog, 'uK2'), (this._k2 || 0) * focalScale ** 2);
-    gl.uniform1f(gl.getUniformLocation(prog, 'uK3'), (this._k3 || 0) * focalScale ** 3);
+    gl.uniform1f(gl.getUniformLocation(prog, 'uK1'), a1);
+    gl.uniform1f(gl.getUniformLocation(prog, 'uK2'), a2);
+    gl.uniform1f(gl.getUniformLocation(prog, 'uK3'), a3);
     gl.uniform1f(gl.getUniformLocation(prog, 'uLinearity'), this._linearity ?? 1);
     gl.uniformMatrix2fv(gl.getUniformLocation(prog, 'uVidRot'), false, [c, s, -s, c]);
-    const center = camera?.center || this._center || [0.5, 0.5];
     gl.uniform2fv(gl.getUniformLocation(prog, 'uCenter'), center);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
     gl.uniform1i(gl.getUniformLocation(prog, 'uFrame'), 0);
   }
 
-  // separable gaussian: srcTex -> dstFbo, ping-ponging through pingFbo/pingTex
-  _blur(srcTex, dstFbo, pingTex, pingFbo, spread) {
-    const gl = this.gl, w = this.cs, h = this.csh;
-    gl.useProgram(this.pBlur); gl.disable(gl.BLEND);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, pingFbo);
-    gl.viewport(0, 0, w, h);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, srcTex);
+  // Blur at a reduced resolution with adjacent samples, then interpolate
+  // back. Each 2x reduction averages every input texel, so even thin features
+  // contribute continuously. Float intermediates preserve tiny coverage
+  // weights at image borders instead of quantizing them into visible lines.
+  _blur(srcTex, dstFbo, pingTex, pingFbo, sigma) {
+    const gl = this.gl;
+    const levels = Math.max(0, Math.min(
+      Math.ceil(Math.log2(Math.max(1, sigma / 2))),
+      Math.floor(Math.log2(Math.min(this.cs, this.csh))) - 1));
+    this._blurLevels ||= [];
+    const blit = (src, dst, w, h) => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, dst); gl.viewport(0, 0, w, h);
+      gl.useProgram(this.pBlit);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src);
+      gl.uniform1i(gl.getUniformLocation(this.pBlit, 'uSrc'), 0);
+      gl.uniform1f(gl.getUniformLocation(this.pBlit, 'uFlipY'), 0);
+      this._quad();
+    };
+    gl.disable(gl.BLEND);
+    let input = srcTex, w = this.cs, h = this.csh, target = dstFbo;
+    for (let level = 0; level < levels; level++) {
+      w = Math.max(1, Math.floor(w / 2)); h = Math.max(1, Math.floor(h / 2));
+      if (!this._blurLevels[level]) {
+        const tex = this._tex(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR, gl.REPEAT);
+        const ping = this._tex(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR, gl.REPEAT);
+        this._blurLevels[level] = { tex, fbo: this._fbo(tex), ping, pingFbo: this._fbo(ping) };
+      }
+      const buffer = this._blurLevels[level];
+      blit(input, buffer.fbo, w, h);
+      input = buffer.tex; target = buffer.fbo;
+      pingTex = buffer.ping; pingFbo = buffer.pingFbo;
+    }
+    gl.useProgram(this.pBlur);
     gl.uniform1i(gl.getUniformLocation(this.pBlur, 'uSrc'), 0);
-    gl.uniform2f(gl.getUniformLocation(this.pBlur, 'uStep'), spread / w, 0);
+    gl.uniform1f(gl.getUniformLocation(this.pBlur, 'uSigma'), Math.max(0.5, sigma / 2 ** levels));
+    gl.bindFramebuffer(gl.FRAMEBUFFER, pingFbo); gl.viewport(0, 0, w, h);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, input);
+    gl.uniform2f(gl.getUniformLocation(this.pBlur, 'uStep'), 1 / w, 0);
     this._quad();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, dstFbo);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target);
     gl.bindTexture(gl.TEXTURE_2D, pingTex);
-    gl.uniform2f(gl.getUniformLocation(this.pBlur, 'uStep'), 0, spread / h);
+    gl.uniform2f(gl.getUniformLocation(this.pBlur, 'uStep'), 0, 1 / h);
     this._quad();
+    if (levels) blit(input, dstFbo, this.cs, this.csh);
   }
 
   _vp() { this.gl.viewport(0, 0, this.cs, this.csh); }
 
-  // frames: [{ img, R (row-major camera->world), gain, weak, vidRot }]. tanX/tanY =
+  // frames: [{ img, R (row-major camera->world), gain, weak, connected, vidRot }]. tanX/tanY =
   // tan(fov/2) for the focal-corrected lens. Fills panoTex.
   compositeStitched(frames, tanX, tanY, k1 = 0, k2 = 0, k3 = 0, linearity = 1, center = [0.5, 0.5]) {
     const gl = this.gl;
@@ -724,16 +772,16 @@ export class PanoEngine {
     this._center = center;
     this._initComposite();
     const w = this.cs, h = this.csh;
-    // A gyro-only frame may be close enough to cover a hole, but it must not
-    // influence a feature-aligned seam. Once we have a viable aligned set,
-    // leave those uncertain areas empty instead of introducing ghost fragments.
-    const blendFrames = frames.filter((f) => !f.weak);
+    // Keep captured coverage, including sensor-positioned frames. Confidence
+    // controls seam ownership, rather than deleting entire captured regions.
+    const blendFrames = frames;
     const rots = blendFrames.map((f) => matT3col(f.R));
     const warpTo = (prog, fbo, k) => {
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
       this._vp();
       const frame = blendFrames[k];
       this._warpUniforms(prog, rots[k], tanX, tanY, frame.gain || 1, frame.vidRot || 0, frame.camera, frame.img);
+      gl.uniform1f(gl.getUniformLocation(prog, 'uEvidence'), frame.weak ? (frame.connected ? 0.5 : 0.1) : 1);
     };
 
     // ---- 1. consensus mosaic (feather average) -> avgTex ----------------
@@ -787,7 +835,7 @@ export class PanoEngine {
       gl.uniform1i(gl.getUniformLocation(this.pLabel, 'uCost'), 1);
       gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uLambda'), fr.weak ? 1.1 : 0.72);
       gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uIndex'), k);
-      gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uPriority'), fr.weak ? 0.08 : 1.0);
+      gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uPriority'), fr.weak ? (fr.connected ? 1 : 0) : 2);
       this._quad();
       gl.disable(gl.DEPTH_TEST);
     });
@@ -798,7 +846,7 @@ export class PanoEngine {
     // band by the same mask blurred widely (so exposure/colour ramps across
     // the seam and the cut stops being visible).
     const bandSplit = Math.max(8, w / 64);   // detail/base cutoff
-    const maskNarrow = Math.max(2, w / 512);
+    const maskNarrow = Math.max(0.65, w / 2048);
     const maskWide = Math.max(24, w / 20);
 
     [this.accHiFbo, this.accLoFbo].forEach((f) => {
@@ -860,8 +908,8 @@ export class PanoEngine {
     gl.uniform1i(gl.getUniformLocation(this.pCombine2, 'uLo'), 1);
     this._quad();
 
-    // Unverified frames have no common geometric anchor with this mosaic.
-    // Filling holes with them creates hard fragments at the coverage boundary.
+    // All confidence levels share the same seam/blend chain, so fallback
+    // coverage meets the main mosaic without a hard holes-only paste.
     const src = this.avgTex;
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.panoFbo);

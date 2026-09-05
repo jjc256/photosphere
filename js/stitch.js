@@ -15,7 +15,7 @@ import { generalizedLensSolver } from './solver-wasm.js';
 import { globalBundleAdjust } from './solver-worker-client.js';
 import {
   ransacHomography, focalFromHomography, relRotFromHomography, ransacGeneralizedRotation, refineRelRot,
-  bundleAdjust, gainCompensate, qToR, matMul3, matT3, logSO3, setGeneralizedLensKernel,
+  bundleAdjust, gainCompensate, anchorComponents, qToR, matMul3, matT3, logSO3, setGeneralizedLensKernel,
 } from './ba.js';
 
 const DEG = Math.PI / 180;
@@ -364,6 +364,8 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
       }
     } catch { /* retain the complete incremental calibration */ }
   }
+  rotations = anchorComponents(rotations, gyroR, root, mainRoot);
+  log.push(`coverage: ${N}/${N} frames retained (${reliable.filter(Boolean).length} main, ${connected.filter((ok, i) => ok && !reliable[i]).length} secondary, ${connected.filter((ok) => !ok).length} sensor-only)`);
   onProgress('optimizing', 1);
 
   // 8. gain compensation over every matched pair

@@ -8,7 +8,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.16.2';
+const APP_VERSION = '0.16.3';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -572,7 +572,7 @@ async function toReview() {
   diag.textContent = `v${APP_VERSION}\n` + (result.log || []).join('\n');
   diag.classList.toggle('err', partial);
   diag.hidden = !partial;   // shows whenever anything went wrong; tap the count chip to toggle
-  $('btn-debug').hidden = !partial;
+  $('btn-debug').hidden = false; // visual defects can occur even when all matches succeeded
 
   try {
     if (result.ok) {
@@ -581,18 +581,18 @@ async function toReview() {
       const s0 = state.shots[0];
       const tanX = Math.tan((state.hfovDeg * DEG) / 2) / result.focalScale;
       const tanY = tanX * (s0.h / s0.w);
-      // Only the main verified component shares a geometric anchor. Other
-      // components and gyro-only frames cannot safely fill its coverage gaps.
+      // Secondary components are rigidly anchored to the main sensor frame.
+      // Keep their coverage, with verified pixels taking seam precedence.
       const reliable = result.reliable || result.connected;
       const nReliable = reliable.filter(Boolean).length;
       const parts = state.shots.map((s, k) => ({
         img: s.imgData, R: result.rotations[k], gain: result.gains[k],
-        weak: !reliable[k],
+        weak: !reliable[k], connected: result.connected[k],
         vidRot: s.vidRot, camera: result.cameras?.[k],
       }));
       const center = result.center || [0.5, 0.5];
       state.engine.compositeStitched(parts, tanX, tanY, result.k1 || 0, result.k2 || 0, result.k3 || 0, result.linearity ?? 1, center);
-      if (nReliable < state.shots.length) toast(`Using ${nReliable} verified frames of ${state.shots.length}`);
+      if (nReliable < state.shots.length) toast(`${state.shots.length} frames kept · ${state.shots.length - nReliable} use motion-assisted placement`);
     } else {
       state.engine.bake(); // gyro-only fallback (from the live splat accumulation)
       toast('Feature match failed — using gyro alignment');
@@ -661,7 +661,7 @@ function saveDebugData() {
     videoWH: [video.videoWidth, video.videoHeight],
     stitchLog: state._stitchLog || [],
     shots: state.shots.map((s) => ({
-      gw: s.gw, gh: s.gh, w: s.w, h: s.h, quat: s.quat, hfovDeg: s.hfovDeg,
+      gw: s.gw, gh: s.gh, w: s.w, h: s.h, quat: s.quat, hfovDeg: s.hfovDeg, vidRot: s.vidRot,
       sharp: s.sharp, feat: s.feat, speed: s.speed, t: s.t, grayB64: b64(s.gray),
     })),
   };

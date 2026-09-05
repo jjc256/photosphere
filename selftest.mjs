@@ -75,7 +75,7 @@ function randSmallQuat(rad) {
 // ---- build frames --------------------------------------------------------------
 const W = 480, H = 360, HFOV = 55 * DEG;
 const F = ((VID_ROT % 2 ? H : W) / 2) / Math.tan(HFOV / 2);
-const yaws = [-75, -45, -15, 15, 45, 75].map((d) => d * DEG);
+const yaws = (process.env.FULL_SPHERE ? Array.from({ length: 12 }, (_, i) => i * 30 - 180) : [-75, -45, -15, 15, 45, 75]).map((d) => d * DEG);
 const pitches = [-13 * DEG, 13 * DEG];
 
 const truthQ = [];
