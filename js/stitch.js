@@ -32,7 +32,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   const w = shots[0].w, h = shots[0].h;
   const cx = w / 2, cy = h / 2;
   const focal0 = (w / 2) / Math.tan(hfov / 2);
-  const bail = () => ({ rotations: gyroR, focalScale: 1, k1: 0, gains: shots.map(() => 1), connected: shots.map(() => true), ok: false, log });
+  const bail = () => ({ rotations: gyroR, focalScale: 1, k1: 0, k2: 0, gains: shots.map(() => 1), connected: shots.map(() => true), ok: false, log });
 
   if (N < 2) { log.push('need >= 2 frames'); return bail(); }
 
@@ -136,23 +136,23 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     return gyroSeed;
   };
   const calibSet = verified.slice().sort((a, b) => b.inl - a.inl).slice(0, 12);
-  const scoreCalib = (fl, kk) => {
+  const scoreCalib = (fl, kk, kk2) => {
     let sse = 0, n = 0;
     for (const v of calibSet) {
-      const r = refineRelRot(seedFor(v, fl), v.mc, fl, { k1: kk, iters: 8 });
+      const r = refineRelRot(seedFor(v, fl), v.mc, fl, { k1: kk, k2: kk2, iters: 8 });
       if (r.inl >= 10 && r.rms < 20) { sse += r.rms * r.rms * r.inl; n += r.inl; }
     }
     return n ? Math.sqrt(sse / n) : 1e9;
   };
-  let k1 = 0;
+  let k1 = 0, k2 = 0;
   if (calibSet.length >= 3) {
-    let best = scoreCalib(focal, 0);
+    let best = scoreCalib(focal, 0, 0);
     for (let round = 0; round < 2; round++) {
       const kStep = round === 0 ? 0.06 : 0.02;
       for (let i = -4; i <= 4; i++) {
         const kk = k1 + i * kStep;
         if (kk < -0.45 || kk > 0.2 || i === 0) continue;
-        const sc = scoreCalib(focal, kk);
+        const sc = scoreCalib(focal, kk, k2);
         if (sc < best) { best = sc; k1 = kk; }
       }
       const fStep = round === 0 ? 0.04 : 0.015;
@@ -160,12 +160,20 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
         if (i === 0) continue;
         const fl = focal * (1 + i * fStep);
         if (fl < 0.5 * focal0 || fl > 2 * focal0) continue;
-        const sc = scoreCalib(fl, k1);
+        const sc = scoreCalib(fl, k1, k2);
         if (sc < best) { best = sc; focal = fl; }
+      }
+      const k2Step = round === 0 ? 0.03 : 0.01;
+      for (let i = -3; i <= 3; i++) {
+        if (i === 0) continue;
+        const kk2 = k2 + i * k2Step;
+        if (kk2 < -0.18 || kk2 > 0.18) continue;
+        const sc = scoreCalib(focal, k1, kk2);
+        if (sc < best) { best = sc; k2 = kk2; }
       }
       await tick();
     }
-    log.push(`lens: k1 ${k1.toFixed(3)}, focal ${focal.toFixed(1)} ` +
+    log.push(`lens: k1 ${k1.toFixed(3)}, k2 ${k2.toFixed(3)}, focal ${focal.toFixed(1)} ` +
       `(${(focal / focal0).toFixed(3)}x), pair rms ${best.toFixed(2)}px`);
   }
 
@@ -175,7 +183,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   for (let e = 0; e < verified.length; e++) {
     onProgress('optimizing', 0.2 + e / verified.length * 0.5);
     const v = verified[e];
-    const { Rrel, rms, inl } = refineRelRot(seedFor(v, focal), v.mc, focal, { k1 });
+    const { Rrel, rms, inl } = refineRelRot(seedFor(v, focal), v.mc, focal, { k1, k2 });
     // accept a pair if it aligns tightly, OR loosely but with lots of inliers
     // (wide-baseline / mild parallax pairs still anchor the graph)
     if (inl >= 10 && (rms < 4 || (rms < 6.5 && inl >= 25))) {
@@ -221,7 +229,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   root.forEach((r, i) => { if (!members.has(r)) members.set(r, []); members.get(r).push(i); });
   let baCount = 0;
   for (const ids of members.values()) {
-    if (ids.length < 3 || ids.length > 12) continue;
+    if (ids.length < 3) continue;
     const local = new Map(ids.map((id, k) => [id, k]));
     const pairs = edges.filter((e) => local.has(e.i) && local.has(e.j)).map((e) => ({
       i: local.get(e.i), j: local.get(e.j),
@@ -230,7 +238,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     if (pairs.length < ids.length - 1) continue;
     try {
       const ba = bundleAdjust(ids.map(() => ({ w, h })), ids.map((id) => rotations[id]), pairs, {
-        focal0: focal, cx, cy, k1, optimizeFocal: false, priorW: 0.08, huber: 5, iters: 10,
+        focal0: focal, cx, cy, k1, k2, optimizeFocal: false, priorW: 0.08, huber: 5, iters: ids.length > 16 ? 5 : 12,
       });
       if (ba.R.every((R) => R.every((v) => isFinite(v)))) {
         ids.forEach((id, k) => { rotations[id] = ba.R[k]; });
@@ -258,7 +266,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   // Small isolated components are locally aligned but not tied to the broader
   // panorama. Render them as weak evidence so a tiny island cannot overwrite
   // a larger, coherent view at a seam.
-  return { rotations, focalScale: focal / focal0, k1, gains, connected, reliable, ok: true, log };
+  return { rotations, focalScale: focal / focal0, k1, k2, gains, connected, reliable, ok: true, log };
 }
 
 class UnionFind {

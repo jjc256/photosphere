@@ -64,6 +64,28 @@ function openCVBackend(cv) {
     match(a, b) {
       if (!a.rows || !b.rows || a.type !== b.type || a.cols !== b.cols) return [];
       const da = makeMat(cv, a), db = makeMat(cv, b);
+      // Panorama uses Lowe's directional best/second-best test for SIFT. It
+      // rejects repeated texture before geometry sees it, unlike a fixed
+      // distance cutoff or mutual-best-only match.
+      if (a.desc instanceof Float32Array && typeof cv.DMatchVectorVector === 'function') {
+        const knn = new cv.DMatchVectorVector();
+        const matcher = new cv.BFMatcher(cv.NORM_L2, false);
+        try {
+          matcher.knnMatch(da, db, knn, 2);
+          const out = [];
+          for (let i = 0; i < knn.size(); i++) {
+            const pair = knn.get(i);
+            if (pair.size() >= 2) {
+              const best = pair.get(0), second = pair.get(1);
+              if (best.distance < second.distance * 0.8) out.push([best.queryIdx, best.trainIdx]);
+            }
+            pair.delete();
+          }
+          return out;
+        } finally {
+          matcher.delete(); knn.delete(); da.delete(); db.delete();
+        }
+      }
       const matches = new cv.DMatchVector();
       const norm = a.desc instanceof Float32Array ? cv.NORM_L2 : cv.NORM_HAMMING;
       const matcher = new cv.BFMatcher(norm, true);

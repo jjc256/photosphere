@@ -102,6 +102,7 @@ uniform mat3 uRot;       // camera -> world (pass transpose of row-major c2w)
 uniform vec2 uTan;       // tan(hfov/2), tan(vfov/2)
 uniform float uGain;
 uniform float uK1;       // radial distortion, solved by the stitcher
+uniform float uK2;
 uniform mat2 uVidRot;    // in-plane frame rotation
 uniform sampler2D uFrame;
 const float PI = 3.14159265359;
@@ -116,7 +117,8 @@ bool warp(out vec3 rgb, out float edge) {
   // sample where the ray actually landed on the sensor
   float xu = cam.x / -cam.z;
   float yu = cam.y / -cam.z;
-  float sd = 1.0 + uK1 * (xu * xu + yu * yu);
+  float r2 = xu * xu + yu * yu;
+  float sd = 1.0 + uK1 * r2 + uK2 * r2 * r2;
   float px = (xu * sd) / uTan.x;
   float py = (yu * sd) / uTan.y;
   if (max(abs(px), abs(py)) > 1.0) return false;
@@ -669,6 +671,7 @@ export class PanoEngine {
     gl.uniform2f(gl.getUniformLocation(prog, 'uTan'), tanX, tanY);
     gl.uniform1f(gl.getUniformLocation(prog, 'uGain'), gain);
     gl.uniform1f(gl.getUniformLocation(prog, 'uK1'), this._k1 || 0);
+    gl.uniform1f(gl.getUniformLocation(prog, 'uK2'), this._k2 || 0);
     gl.uniformMatrix2fv(gl.getUniformLocation(prog, 'uVidRot'), false, [c, s, -s, c]);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
@@ -695,9 +698,10 @@ export class PanoEngine {
 
   // frames: [{ img, R (row-major camera->world), gain, weak, vidRot }]. tanX/tanY =
   // tan(fov/2) for the focal-corrected lens. Fills panoTex.
-  compositeStitched(frames, tanX, tanY, k1 = 0) {
+  compositeStitched(frames, tanX, tanY, k1 = 0, k2 = 0) {
     const gl = this.gl;
     this._k1 = k1;
+    this._k2 = k2;
     this._initComposite();
     const w = this.cs, h = this.csh;
     // A gyro-only frame may be close enough to cover a hole, but it must not
