@@ -19,3 +19,6 @@ export const sin = (a) => new Dual(Math.sin(a.value), a.gradient.map((v) => v * 
 export const cos = (a) => new Dual(Math.cos(a.value), a.gradient.map((v) => -v * Math.sin(a.value)));
 export const sqrt = (a) => { const v = Math.sqrt(a.value); return new Dual(v, a.gradient.map((x) => v ? x / (2 * v) : 0)); };
 export const atan = (a) => new Dual(Math.atan(a.value), a.gradient.map((v) => v / (1 + a.value * a.value)));
+export const exp = (a) => { const v = Math.exp(a.value); return new Dual(v, a.gradient.map((x) => x * v)); };
+export const acos = (a) => new Dual(Math.acos(a.value), a.gradient.map((x) => x / -Math.sqrt(Math.max(1e-24, 1 - a.value * a.value))));
+export const tan = (a) => div(sin(a), cos(a));

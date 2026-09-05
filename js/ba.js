@@ -1,3 +1,5 @@
+import { Dual, add as adAdd, mul as adMul } from './autodiff.js';
+
 // Geometry back-end for the stitcher: SO(3) exp/log, a dense linear solver,
 // homography RANSAC (for pair verification), IMU-seeded global bundle
 // adjustment over camera rotations + one shared focal length, and gain
@@ -280,11 +282,16 @@ export function undistortPt(x, y, a = 0, b = 0, c = 0) {
   if (rd < 1e-12 || (!a && !b && !c)) return [x, y];
   let r = generalizedKernel ? generalizedKernel.ptlens_undistort(rd, a, b, c) : rd;
   if (!generalizedKernel) for (let i = 0; i < 10; i++) {
-    const r2 = r * r;
-    const value = r + a * r2 + b * r2 * r + c * r2 * r2 - rd;
-    const deriv = 1 + 2 * a * r + 3 * b * r2 + 4 * c * r2 * r;
+    // This is the same forward-mode derivative mechanism used by Panorama's
+    // parameter blocks. Using it here removes a hand-maintained polynomial
+    // derivative from the camera inverse and keeps the model's calculus in
+    // one implementation path.
+    const q = Dual.variable(r, 1, 0);
+    const q2 = adMul(q, q), q3 = adMul(q2, q), q4 = adMul(q2, q2);
+    const value = adAdd(adAdd(adAdd(q, adMul(q2, a)), adMul(q3, b)), adMul(q4, c));
+    const deriv = value.gradient[0];
     if (Math.abs(deriv) < 1e-10) break;
-    r -= value / deriv;
+    r -= (value.value - rd) / deriv;
   }
   return [x * r / rd, y * r / rd];
 }
