@@ -8,7 +8,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.16.4';
+const APP_VERSION = '0.16.5';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));

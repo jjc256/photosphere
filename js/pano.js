@@ -1,3 +1,4 @@
+import { seamLabels } from './seams.js';
 import { projectionRadiusLimit } from './camera-geometry.js';
 import { overlapExposure } from './exposure.js';
 
@@ -156,8 +157,8 @@ void main() {
   frag = vec4(rgb, 1.0);
 }`;
 
-// Feather-weighted accumulate -> a consensus mosaic, used as the reference
-// the seam finder measures each frame against.
+// Feather-weighted accumulation retains actual captured coverage for the
+// final reconstruction, independent of the reduced-resolution seam masks.
 const FA_FRAG = WARP_HEAD + `
 out vec4 frag;
 uniform float uEvidence;
@@ -166,43 +167,6 @@ void main() {
   if (!warp(rgb, edge)) discard;
   float w = (edge * edge + 0.02) * uEvidence;
   frag = vec4(rgb * w, w);
-}`;
-
-// Photometric disagreement between this frame and the consensus. Blurred
-// afterwards, this is the seam-finding cost: the Kwatra graph-cut objective
-// routes cuts through pixels where the sources agree, and minimising a
-// smoothed version of the same |A - B| term is a cheap stand-in for it.
-const DIFF_FRAG = WARP_HEAD + `
-out vec4 frag;
-uniform sampler2D uAvg;
-void main() {
-  vec3 rgb; float edge;
-  if (!warp(rgb, edge)) { frag = vec4(1.0); return; }  // no data = maximum cost
-  vec4 a = texture(uAvg, vUv);
-  float d = a.a > 0.5 ? clamp(length(rgb - a.rgb) * 1.4, 0.0, 1.0) : 0.0;
-  frag = vec4(vec3(d), 1.0);
-}`;
-
-// Seam labelling. Priority = border distance - lambda * (blurred disagreement
-// with the consensus), so seams bend away from parallax / moving objects and
-// through regions where the frames match. Winner via the depth buffer.
-const LABEL_FRAG = WARP_HEAD + `
-out vec4 frag;
-uniform float uIndex;
-uniform float uPriority;               // 2=main, 1=secondary component, 0=sensor-only
-uniform float uLambda;
-uniform sampler2D uCost;
-void main() {
-  vec3 rgb; float edge;
-  if (!warp(rgb, edge)) discard;
-  float cost = texture(uCost, vUv).r;
-  float center = smoothstep(0.02, 0.45, edge);
-  float quality = clamp(center * edge - uLambda * cost, 0.0, 1.0);
-  // Disjoint depth ranges keep a motion-only image from winning ownership
-  // over any verified pixel. Narrow mask feathering softens their boundary.
-  float pri = (uPriority + 0.9 * quality) / 3.0;
-  gl_FragDepth = 0.999 - pri * 0.998;    // higher priority -> smaller depth -> wins
-  frag = vec4((uIndex + 1.0) / 255.0, edge, 0.0, 1.0);
 }`;
 
 // Binary ownership mask for one frame (1 where it won the seam label).
@@ -428,9 +392,7 @@ export class PanoEngine {
     this.pPresent = program(gl, PRESENT_FRAG);
     this.pSphere = program(gl, SPHERE_FRAG);
     this.pCoverage = program(gl, COVERAGE_FRAG);
-    this.pLabel = program(gl, LABEL_FRAG);
     this.pWarpC = program(gl, WARPC_FRAG);
-    this.pDiff = program(gl, DIFF_FRAG);
     this.pMask = program(gl, MASK_FRAG);
     this.pReduce = program(gl, REDUCE_FRAG);
     this.pSourceFill = program(gl, SOURCE_FILL_FRAG);
@@ -683,7 +645,7 @@ export class PanoEngine {
 
   // ---- multi-band seam compositor --------------------------------------
   // Standard stitcher compositing chain (OpenCV Stitcher / enblend):
-  //   consensus mosaic -> content-aware seam labels -> Burt-Adelson
+  //   coverage mosaic -> graph-cut seam labels -> Burt-Adelson
   //   multi-band blend.
   // Intermediates run at 2048 wide to keep iOS GPU memory sane; the result
   // is upscaled into panoTex.
@@ -701,14 +663,7 @@ export class PanoEngine {
     this.accHi = t16(); this.accHiFbo = this._fbo(this.accHi);
     this.accLo = t16(); this.accLoFbo = this._fbo(this.accLo);
     this.labelTex = this._tex(cs, this.csh, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST, gl.REPEAT);
-    this.labelFbo = gl.createFramebuffer();
-    this.labelDepth = gl.createRenderbuffer();
-    gl.bindRenderbuffer(gl.RENDERBUFFER, this.labelDepth);
-    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, cs, this.csh);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.labelFbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.labelTex, 0);
-    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, this.labelDepth);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.labelFbo = this._fbo(this.labelTex);
     this.avgTex = t8(); this.avgFbo = this._fbo(this.avgTex);
     this.wTex = t8(); this.wFbo = this._fbo(this.wTex);        // warped frame
     this.mTex = t16(); this.mFbo = this._fbo(this.mTex);        // mask / scratch
@@ -723,7 +678,7 @@ export class PanoEngine {
       this.pyramid.push({ w, h, source, sourceFbo: this._fbo(source), mask, maskFbo: this._fbo(mask),
         accum, accumFbo: this._fbo(accum), result, resultFbo: this._fbo(result) });
     }
-    this.exposureTex = this._tex(256, 128, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST, gl.REPEAT);
+    this.exposureTex = this._tex(512, 256, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST, gl.REPEAT);
     this.exposureFbo = this._fbo(this.exposureTex);
     this._compReady = true;
   }
@@ -831,23 +786,23 @@ export class PanoEngine {
     // images which have no feature-match edge in the alignment graph.
     const exposureWarps = blendFrames.map((frame, k) => {
       this._uploadFrame(frame.img);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.exposureFbo); gl.viewport(0, 0, 256, 128);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.exposureFbo); gl.viewport(0, 0, 512, 256);
       gl.disable(gl.BLEND); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
       gl.useProgram(this.pWarpC);
       this._warpUniforms(this.pWarpC, rots[k], tanX, tanY, 1, frame.vidRot || 0, frame.camera, frame.img);
       this._quad();
-      const pixels = new Uint8Array(256 * 128 * 4);
-      gl.readPixels(0, 0, 256, 128, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+      const pixels = new Uint8Array(512 * 256 * 4);
+      gl.readPixels(0, 0, 512, 256, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
       return pixels;
     });
-    const colorGains = overlapExposure(exposureWarps, 256, 128, blendFrames.map((f) => f.gain || 1));
+    const colorGains = overlapExposure(exposureWarps, 512, 256, blendFrames.map((f) => f.gain || 1));
     this.exposureGains = colorGains;
     const warpTo = (prog, fbo, k) => {
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
       this._vp();
       const frame = blendFrames[k];
       this._warpUniforms(prog, rots[k], tanX, tanY, 1, frame.vidRot || 0, frame.camera, frame.img, colorGains[k]);
-      gl.uniform1f(gl.getUniformLocation(prog, 'uEvidence'), frame.weak ? (frame.connected ? 0.5 : 0.1) : 1);
+      gl.uniform1f(gl.getUniformLocation(prog, 'uEvidence'), frame.weak && !frame.connected ? 0.1 : 1);
     };
 
     // ---- 1. consensus mosaic (feather average) -> avgTex ----------------
@@ -869,42 +824,17 @@ export class PanoEngine {
     gl.uniform1i(gl.getUniformLocation(this.pNorm2, 'uAccum'), 0);
     this._quad();
 
-    // ---- 2. content-aware seam labels -----------------------------------
-    // For each frame: how much it disagrees with the consensus, blurred (the
-    // smoothing is what makes the resulting boundary a smooth seam rather
-    // than per-pixel noise), then a depth-tested "who wins" draw where
-    // priority = borderDistance - lambda * disagreement.
-    const costBlur = Math.max(6, w / 128);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.labelFbo);
-    this._vp(); gl.disable(gl.BLEND);
-    gl.clearColor(0, 0, 0, 0); gl.clearDepth(1.0);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-    blendFrames.forEach((fr, k) => {
-      this._uploadFrame(fr.img);
-      // disagreement -> mTex
-      gl.useProgram(this.pDiff);
-      warpTo(this.pDiff, this.mFbo, k);
-      gl.disable(gl.BLEND);
-      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.avgTex);
-      gl.uniform1i(gl.getUniformLocation(this.pDiff, 'uAvg'), 1);
-      this._quad();
-      this._blur(this.mTex, this.mHiFbo, this.pingTex, this.pingFbo, costBlur);
-
-      // depth-tested label draw
-      gl.useProgram(this.pLabel);
-      warpTo(this.pLabel, this.labelFbo, k);
-      gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.depthMask(true);
-      gl.disable(gl.BLEND);
-      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.mHi);
-      gl.uniform1i(gl.getUniformLocation(this.pLabel, 'uCost'), 1);
-      gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uLambda'), fr.weak ? 1.1 : 0.72);
-      gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uIndex'), k);
-      gl.uniform1f(gl.getUniformLocation(this.pLabel, 'uPriority'), fr.weak ? (fr.connected ? 1 : 0) : 2);
-      this._quad();
-      gl.disable(gl.DEPTH_TEST);
-    });
+    // ---- 2. graph-cut seam labels -------------------------------------
+    const labels = seamLabels(exposureWarps, 512, 256, colorGains,
+      blendFrames.map((fr) => !fr.weak || fr.connected));
+    const labelPixels = new Uint8Array(w * h * 4);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const p = Math.min(255, Math.floor((y + 0.5) * 256 / h)) * 512 + Math.min(511, Math.floor((x + 0.5) * 512 / w));
+      labelPixels[(y * w + x) * 4] = labels[p] + 1;
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.labelTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, labelPixels);
 
     // ---- 3. Full Gaussian-mask / Laplacian-image pyramid blend ---------
     const pyramid = this.pyramid;

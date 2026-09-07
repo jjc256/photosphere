@@ -136,6 +136,22 @@ try {
   gl.readPixels(294, 128, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, remote);
   assert(remote[0] === 1, 'fallback replaced verified seam ownership');
   logs.push('seam ownership: verified pixels win over fallback frames');
+  const groupFrames = [
+    { img: solid, R: identity, gain: 1, weak: false, connected: true },
+    { img: solid, R: expSO3([0, -0.45, 0]), gain: 1, weak: true, connected: true },
+  ];
+  const groupLabels = () => {
+    engine.compositeStitched(groupFrames, 0.6, 0.6);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, engine.labelFbo);
+    const pixels = new Uint8Array(512 * 256 * 4);
+    gl.readPixels(0, 0, 512, 256, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    return pixels;
+  };
+  const beforeGroupSwap = groupLabels();
+  groupFrames[0].weak = true; groupFrames[1].weak = false;
+  const afterGroupSwap = groupLabels();
+  assert(beforeGroupSwap.every((v, i) => v === afterGroupSwap[i]), 'largest component changed seam ownership');
+  logs.push('seam ownership: independent of which verified component is largest');
   // Six overlapping cube-face views cover the poles and longitude wrap too.
   // Unlike a flat-colour fixture, world-space colour gradients reveal seams.
   const colour = (d) => [128 + 70 * d[0], 128 + 60 * d[1], 128 + 50 * d[2]];
