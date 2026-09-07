@@ -15,7 +15,7 @@ import { generalizedLensSolver } from './solver-wasm.js';
 import { globalBundleAdjust } from './solver-worker-client.js';
 import {
   ransacHomography, focalFromHomography, relRotFromHomography, ransacGeneralizedRotation, refineRelRot,
-  bundleAdjust, gainCompensate, anchorComponents, qToR, matMul3, matT3, logSO3, setGeneralizedLensKernel,
+  bundleAdjust, gainCompensate, anchorComponents, rayFromFilm, matVec3, qToR, matMul3, matT3, logSO3, setGeneralizedLensKernel,
 } from './ba.js';
 
 const DEG = Math.PI / 180;
@@ -162,12 +162,23 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
   // 3. match + homography verification
   const verified = []; // { i, j, mc:[centered matches], inl, Ii, Ij, H }
   const focals = [];
+  const retryPairs = [];
   let bestRaw = 0, bestInl = 0;
   for (let c = 0; c < cand.length; c++) {
     onProgress('matching', c / cand.length);
     const [i, j] = cand[c];
     const raw = vision.match(feats[i], feats[j]);
     bestRaw = Math.max(bestRaw, raw.length);
+    // Save smaller descriptor sets for a stricter, sensor-guided pass after
+    // the lens is calibrated. A desktop-sized feature-count floor alone can
+    // disconnect otherwise good overlaps in downscaled phone images.
+    const retrySeed = matMul3(matT3(gyroR[j]), gyroR[i]);
+    if (raw.length >= 12 && retrySeed[8] > Math.cos(2 * Math.atan(0.6 / focal0) + 0.2)) {
+      retryPairs.push({ i, j, seed: retrySeed, mc: raw.map(([a, b]) => [
+        ...filmPoint(feats[i].kps[a].x, feats[i].kps[a].y, shots[i]),
+        ...filmPoint(feats[j].kps[b].x, feats[j].kps[b].y, shots[j]),
+      ]) });
+    }
     // Panorama's PairAlignment refuses underspecified descriptor sets before
     // RANSAC (40 raw matches, then at least 25 coarse inliers).  The lower
     // browser thresholds admitted weak texture as geometry and produced cuts.
@@ -223,7 +234,7 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     await tick();
   }
   log.push(`verified pairs: ${verified.length} (best raw matches ${bestRaw}, best inliers ${bestInl}, ${cand.length} pairs tried)`);
-  if (verified.length === 0) return bail();
+  if (verified.length === 0 && retryPairs.length === 0) return bail();
 
   // 4. focal length: median of the per-homography estimates
   let focal = focals.length >= 3 ? median(focals) : focal0;
@@ -319,6 +330,42 @@ export async function stitch(shots, { onProgress = () => {} } = {}) {
     v.rms = rms;
     await tick();
   }
+  const accepted = new Set(edges.map((e) => e.i * N + e.j));
+  let recovered = 0;
+  const tentative = [];
+  for (let p = 0; p < retryPairs.length; p++) {
+    const pair = retryPairs[p];
+    if (accepted.has(pair.i * N + pair.j)) continue;
+    onProgress('connecting overlaps', p / retryPairs.length);
+    await tick();
+    // Remove descriptor aliases that would require a rotation outside this
+    // pass's sensor bound before sampling. Otherwise a textured blind can
+    // drown 20 good correspondences in hundreds of impossible candidates.
+    const guided = pair.mc.filter((m) => {
+      const a = matVec3(pair.seed, rayFromFilm(m[0], m[1], focal, k1, k2, k3, linearity));
+      const b = rayFromFilm(m[2], m[3], focal, k1, k2, k3, linearity);
+      return a.reduce((s, v, i) => s + v * b[i], 0) > Math.cos(10 * DEG);
+    });
+    const fit = ransacGeneralizedRotation(guided, focal, pair.seed, {
+      k1, k2, k3, linearity, minMatches: 12, minInliers: 12, iters: 220, thresh: 4 / coordinateScale,
+    });
+    if (fit.inliers.length < 12 || fit.inliers.length < 0.12 * pair.mc.length) continue;
+    const matches = fit.inliers.map((i) => guided[i]);
+    if (!distributedMatches(matches)) continue;
+    const off = Math.hypot(...logSO3(matMul3(fit.Rrel, matT3(pair.seed))));
+    if (off > 8 * DEG) continue;
+    const refined = refineRelRot(fit.Rrel, matches, focal, {
+      k1, k2, k3, linearity, outlierFloor: 2 / coordinateScale,
+    });
+    if (refined.inl < 12 || refined.rms > 2 / coordinateScale || !distributedMatches(refined.matches)) continue;
+    const edge = { i: pair.i, j: pair.j, Rrel: refined.Rrel, w: refined.inl, mc: refined.matches };
+    if (fit.inliers.length < 0.45 * pair.mc.length) tentative.push(edge);
+    else { edges.push(edge); recovered++; }
+    await tick();
+  }
+  const corroborated = cycleSupportedPairs(edges, tentative);
+  edges.push(...corroborated);
+  log.push(`additional calibrated overlaps: ${recovered}, cycle-confirmed: ${corroborated.length} [${corroborated.map((e) => `${e.i}-${e.j}`).join(",")}]`);
   log.push(`good edges: ${edges.length}`);
   log.push('pairs: ' + verified.map((v) => `${v.i}-${v.j}:${v.rms == null ? '9.0' : (v.rms * coordinateScale).toFixed(1)}/${v.inl}`).join(' '));
   if (edges.length === 0) return bail();
@@ -392,4 +439,48 @@ class UnionFind {
   constructor(n) { this.p = Array.from({ length: n }, (_, i) => i); }
   find(x) { while (this.p[x] !== x) { this.p[x] = this.p[this.p[x]]; x = this.p[x]; } return x; }
   union(a, b) { this.p[this.find(a)] = this.find(b); }
+}
+
+// Spread in both source images rules out a row of repeated/collinear features
+// that has many inliers but cannot stably constrain a three-axis rotation.
+export function distributedMatches(matches) {
+  if (matches.length < 12) return false;
+  for (const offset of [0, 2]) {
+    const mx = matches.reduce((s, m) => s + m[offset], 0) / matches.length;
+    const my = matches.reduce((s, m) => s + m[offset + 1], 0) / matches.length;
+    let xx = 0, xy = 0, yy = 0;
+    for (const m of matches) {
+      const x = m[offset] - mx, y = m[offset + 1] - my;
+      xx += x * x; xy += x * y; yy += y * y;
+    }
+    const trace = xx + yy;
+    if (trace / matches.length < 0.001 || (xx * yy - xy * xy) / (trace * trace) < 0.005) return false;
+  }
+  return true;
+}
+
+// Repetitive scenes can have a low inlier fraction despite a good geometric
+// fit. Admit those edges only when two independent views close a triangle
+// through an already verified edge; do not turn a low ratio into global trust.
+export function cycleSupportedPairs(edges, candidates) {
+  const key = (i, j) => `${i}:${j}`;
+  const links = new Map();
+  for (const e of edges) {
+    links.set(key(e.i, e.j), e.Rrel);
+    links.set(key(e.j, e.i), matT3(e.Rrel));
+  }
+  const good = new Set();
+  for (let i = 0; i < candidates.length; i++) for (const b of [...candidates.slice(i + 1), ...edges]) {
+    const a = candidates[i];
+    const shared = [a.i, a.j].find((v) => v === b.i || v === b.j);
+    if (shared === undefined) continue;
+    const na = shared === a.i ? a.j : a.i, nb = shared === b.i ? b.j : b.i;
+    const link = links.get(key(na, nb));
+    if (!link) continue;
+    const ra = shared === a.i ? a.Rrel : matT3(a.Rrel);
+    const rb = shared === b.i ? b.Rrel : matT3(b.Rrel);
+    if (Math.hypot(...logSO3(matMul3(matMul3(link, ra), matT3(rb)))) > DEG) continue;
+    good.add(a); good.add(b);
+  }
+  return candidates.filter((e) => good.has(e));
 }

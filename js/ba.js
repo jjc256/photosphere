@@ -389,7 +389,7 @@ export function undistortPt(x, y, a = 0, b = 0, c = 0) {
 // generalized ray radius by focal length.  Keeping that order matters whenever
 // focal is calibrated: applying the polynomial to x/f (the former browser
 // implementation) describes a different camera.
-function rayFromFilm(x, y, focal, k1, k2, k3, linearity) {
+export function rayFromFilm(x, y, focal, k1 = 0, k2 = 0, k3 = 0, linearity = 1) {
   const u = undistortPt(x, y, k1, k2, k3);
   const r = hypot2(u[0], u[1]);
   if (val(r) < 1e-12) return [0, 0, -1];
@@ -512,8 +512,9 @@ export function refineRelRot(Rrel0, m0, f, {
 // optional focal vote and make geometric reprojection the acceptance test.
 export function ransacGeneralizedRotation(matches, f, seedR, {
   k1 = 0, k2 = 0, k3 = 0, linearity = 1, iters = 220, thresh = 4, seed = 0x9e3779b9,
+  minMatches = 40, minInliers = 25,
 } = {}) {
-  if (matches.length < 40) return { Rrel: seedR, inliers: [] };
+  if (matches.length < Math.max(4, minMatches)) return { Rrel: seedR, inliers: [] };
   let state = seed >>> 0;
   const rnd = () => { state = (state * 1664525 + 1013904223) >>> 0; return state; };
   const errors = (R) => matches.map((m) => {
@@ -534,7 +535,7 @@ export function ransacGeneralizedRotation(matches, f, seedR, {
     for (const [i, e] of errors(fit.Rrel).entries()) if (e < thresh) inliers.push(i);
     if (inliers.length > best.inliers.length) best = { Rrel: fit.Rrel, inliers };
   }
-  if (best.inliers.length < 25) return best;
+  if (best.inliers.length < minInliers) return best;
   const refined = refineRelRot(best.Rrel, best.inliers.map((i) => matches[i]), f,
     { k1, k2, k3, linearity, iters: 16, outlierFloor: thresh * 0.625 });
   const finalErr = errors(refined.Rrel);

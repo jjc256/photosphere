@@ -72,7 +72,8 @@ the rare browser that hands the camera feed sideways.
 | `js/cv-features.js` + `js/vendor/opencv.js` | On-device **OpenCV WebAssembly** vision backend, custom-built with SIFT enabled and SIMD. It uses SIFT descriptors with BF L2 nearest-neighbor ratio filtering; the prior compact JavaScript ORB implementation remains only as an offline/runtime fallback. |
 | `solver/` + `js/ba.js` | Rust WebAssembly generalized-camera kernel (Gennery projection) plus geometry back-end: direct generalized-camera RANSAC, all-pairs overlap discovery, calibrated shared focal/principal-point/generalized projection (`L`)/three-coefficient PTLens radial model, regularized per-frame focal/principal-point correction, global pose-and-lens bundle adjustment, and gain compensation. `js/solver-worker.js` runs the global solve off the UI thread. |
 | `js/stitch.js` | Runs once on **Done**: OpenCV-WASM features → overlap-graph matching → RANSAC-verify → median focal → **calibrate the lens** (solve k₁ and polish the focal by minimising total pairwise reprojection error) → refine each pair's rotation → rotation-average → component bundle adjustment → gain-compensate. Separate feature groups are rigidly placed using the IMU; sensor-only frames retain coverage at lower seam priority. |
-| `js/pano.js` | WebGL2 engine. `splat()` drives the live capture preview. `compositeStitched()` runs the standard stitcher compositing chain: warp every frame to the sphere → build a consensus mosaic → **content-aware seam labels** (border distance minus a blurred photometric-disagreement term, a cheap stand-in for Kwatra graph-cut seams, resolved with the depth buffer) → **Burt–Adelson multi-band blend** (each source's detail band weighted by its mask blurred narrowly, its base band by the same mask blurred widely) → upscale to `panoTex`. Also the interactive sphere view and equirect read-back for export. |
+| `js/pano.js` | WebGL2 engine. `splat()` drives the live capture preview. `compositeStitched()` runs the standard stitcher compositing chain: warp every frame to the sphere → build a consensus mosaic → **content-aware seam labels** (border distance minus a blurred photometric-disagreement term, a cheap stand-in for Kwatra graph-cut seams, resolved with the depth buffer) → **Burt–Adelson multi-band blend** (Gaussian ownership masks weight a full Laplacian image pyramid, with coverage-aware border extension) → upscale to `panoTex`. Also the interactive sphere view and equirect read-back for export. |
+| `js/exposure.js` | Estimates per-channel exposure and white-balance corrections from all geometric overlaps, including plain walls without matched features. Rejects saturation and inconsistent overlap samples, and preserves highlights. |
 | `js/xmp.js` | Builds the GPano XMP packet and splices metadata segments into the JPEG (EXIF then XMP, after `APP0`). |
 | `js/exif.js` | Hand-rolled big-endian **EXIF `APP1`** writer — GPS position, capture time, view direction — the tags Google Maps / Street View needs. |
 | `js/app.js` | Camera + permissions, the auto-capture heuristic (angular step ≈ 0.42 × FOV, only while steady), the coverage grid including explicit zenith/nadir captures, per-frame stash (full-res `ImageData` + a downscaled luma copy for features), the location watch, the review viewer, and export/download. |
@@ -170,6 +171,9 @@ four frame rotations and four projection models, radial-fold rejection, a
 continuous wide blur, complete 360° coverage, and the browser SIFT backend.
 `FULL_SPHERE=1 node selftest.mjs` checks a complete 24-frame sweep;
 `node selftest-components.mjs` checks component anchoring and radial bounds.
+`node selftest-exposure.mjs` checks exposure/WB recovery, small match sets, and
+three-image cycle validation. The browser test also renders a full sphere with
+different exposure and white balance in each source and measures seam error.
 
 Feature pixels are converted to right/up camera axes before alignment. Calibration
 uses normalized film units; the renderer converts principal points to source UVs
@@ -177,6 +181,10 @@ and applies distortion at each frame's calibrated focal length, bounded to the
 first monotonic radial branch. Captured frames are retained even when feature
 matching cannot link the entire sphere. Verified frames take seam precedence;
 secondary groups and motion-only frames provide lower-confidence coverage. The
-blend uses adjacent-pixel Gaussian kernels on a float texture pyramid, preventing
-repeated stripes and quantized lines near coverage borders. The debug download
+blend uses a full Laplacian image pyramid with Gaussian ownership masks and
+float intermediates. Each source is extended beyond its boundary before band
+differencing, avoiding border halos. Geometric overlaps also drive exposure/WB
+correction, so textureless walls no longer receive unrelated brightness gains.
+Low-contrast SIFT detection and a calibrated retry pass recover smaller overlaps;
+low-inlier-ratio matches require corroboration through a three-image cycle. The debug download
 remains available after every stitch, including apparently successful ones.

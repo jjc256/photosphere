@@ -1,4 +1,5 @@
 import { projectionRadiusLimit } from './camera-geometry.js';
+import { overlapExposure } from './exposure.js';
 
 // WebGL2 equirectangular panorama engine.
 //
@@ -107,6 +108,7 @@ uniform float uK1;       // radial distortion, solved by the stitcher
 uniform float uK2;
 uniform float uK3;
 uniform float uLinearity;
+uniform vec3 uColorGain;
 uniform float uMaxRadius; // first monotonic radial branch, bounded by source corners
 uniform mat2 uVidRot;    // in-plane frame rotation
 uniform vec2 uCenter;    // calibrated principal point in source UVs
@@ -140,7 +142,7 @@ bool warp(out vec3 rgb, out float edge) {
   vec2 rp = uVidRot * vec2(px, py);
   vec2 uv = rp * 0.5 + uCenter;
   if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return false;
-  rgb = clamp(texture(uFrame, uv).rgb * uGain, 0.0, 1.0);
+  rgb = clamp(texture(uFrame, uv).rgb * uGain * uColorGain, 0.0, 1.0);
   edge = 2.0 * min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));   // distance to nearest frame edge, 0..1
   return true;
 }`;
@@ -215,29 +217,80 @@ void main() {
   frag = vec4(abs(lab - uWant) < 0.5 ? 1.0 : 0.0);
 }`;
 
-// Burt-Adelson band accumulation. Each source's own band is weighted by that
-// source's mask blurred to THAT band's width: narrow for detail (so detail
-// stays single-source and can't ghost), wide for the base (so exposure and
-// colour ramp across the seam and the cut disappears).
-const ACC_FRAG = `#version 300 es
+// Gaussian pyramid reduction, using the separable [1,4,6,4,1]/16 kernel.
+// Bilinear taps at +/-1.2 combine its outer coefficients into nine samples.
+const REDUCE_FRAG = `#version 300 es
 precision highp float;
 in vec2 vUv;
 out vec4 frag;
-uniform sampler2D uW;      // warped frame (a = coverage)
-uniform sampler2D uWLo;    // blurred warped frame
-uniform sampler2D uMask;   // this frame's mask, blurred to the band width
-uniform float uHigh;       // 1 = detail band (W - WLo), 0 = base band (WLo)
+uniform sampler2D uSrc;
+uniform vec2 uTexel;
 void main() {
-  float m = texture(uMask, vUv).r;
-  if (m <= 0.002) discard;
-  vec4 w = texture(uW, vUv);
-  if (w.a < 0.5) discard;              // only where this frame really covers
-  // uWLo is a blur of (rgb, coverage), so divide out the coverage weight -
-  // otherwise the blur drags in black from beyond the frame border.
-  vec4 l = texture(uWLo, vUv);
-  vec3 lo = l.a > 1e-3 ? l.rgb / l.a : w.rgb;
-  vec3 band = uHigh > 0.5 ? (w.rgb - lo) : lo;
-  frag = vec4(band * m, m);
+  vec4 sum = vec4(0.0);
+  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+    float weight = (x == 0 ? 0.375 : 0.3125) * (y == 0 ? 0.375 : 0.3125);
+    sum += weight * texture(uSrc, vUv + vec2(x, y) * uTexel * 1.2);
+  }
+  frag = sum;
+}`;
+
+// Normalize each Gaussian level at its texel centres, and extend uncovered
+// texels from the next coarser level. This pull/push extension ensures that
+// Laplacians telescope exactly even at image borders (division after bilinear
+// interpolation would otherwise leave a halo on a single isolated image).
+const SOURCE_FILL_FRAG = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 frag;
+uniform sampler2D uSource;
+uniform sampler2D uCoarse;
+uniform bool uBase;
+void main() {
+  vec4 s = texture(uSource, vUv);
+  vec3 value = s.a > 1e-6 ? s.rgb / s.a : (uBase ? vec3(0.0) : texture(uCoarse, vUv).rgb);
+  frag = vec4(value, 1.0);
+}`;
+
+const LAPLACIAN_FRAG = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 frag;
+uniform sampler2D uFine;
+uniform sampler2D uCoarse;
+uniform sampler2D uMask;
+uniform bool uBase;
+void main() {
+  float weight = texture(uMask, vUv).r;
+  if (weight < 1e-6) discard;
+  vec3 fine = texture(uFine, vUv).rgb, coarse = texture(uCoarse, vUv).rgb;
+  frag = vec4((uBase ? fine : fine - coarse) * weight, weight);
+}`;
+
+const RECONSTRUCT_FRAG = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 frag;
+uniform sampler2D uBand;
+uniform sampler2D uCoarse;
+uniform bool uBase;
+void main() {
+  vec4 band = texture(uBand, vUv);
+  vec3 value = band.a > 1e-6 ? band.rgb / band.a : vec3(0.0);
+  if (!uBase) value += texture(uCoarse, vUv).rgb;
+  frag = vec4(value, 1.0);
+}`;
+
+const FINISH_FRAG = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 frag;
+uniform sampler2D uResult;
+uniform sampler2D uCoverage;
+void main() {
+  // A coarse Gaussian extends outside actual coverage; clip only at the final
+  // level, after reconstruction, instead of cutting each band's support.
+  float covered = texture(uCoverage, vUv).a;
+  frag = covered > 0.5 ? vec4(clamp(texture(uResult, vUv).rgb, 0.0, 1.0), 1.0) : vec4(0.0);
 }`;
 
 // Dense Gaussian kernel at the selected pyramid level. Tap spacing stays
@@ -258,22 +311,6 @@ void main() {
     wsum += w;
   }
   frag = acc / wsum;
-}`;
-
-// Collapse the blended bands: detail/W + base/W. Away from every seam each
-// band comes wholly from one frame and the sum is exactly that frame.
-const COMBINE2_FRAG = `#version 300 es
-precision highp float;
-in vec2 vUv;
-out vec4 frag;
-uniform sampler2D uHi;     // detail band accumulator (rgb*m, m)
-uniform sampler2D uLo;     // base band accumulator   (rgb*m, m)
-void main() {
-  vec4 hi = texture(uHi, vUv);
-  vec4 lo = texture(uLo, vUv);
-  if (lo.a <= 1e-4) { frag = vec4(0.0); return; }
-  vec3 c = lo.rgb / lo.a + (hi.a > 1e-4 ? hi.rgb / hi.a : vec3(0.0));
-  frag = vec4(clamp(c, 0.0, 1.0), 1.0);
 }`;
 
 // Fill only genuinely uncovered output pixels from gyro-positioned frames.
@@ -395,11 +432,14 @@ export class PanoEngine {
     this.pWarpC = program(gl, WARPC_FRAG);
     this.pDiff = program(gl, DIFF_FRAG);
     this.pMask = program(gl, MASK_FRAG);
-    this.pAcc = program(gl, ACC_FRAG);
+    this.pReduce = program(gl, REDUCE_FRAG);
+    this.pSourceFill = program(gl, SOURCE_FILL_FRAG);
+    this.pLaplacian = program(gl, LAPLACIAN_FRAG);
+    this.pReconstruct = program(gl, RECONSTRUCT_FRAG);
+    this.pFinish = program(gl, FINISH_FRAG);
     this.pFA = program(gl, FA_FRAG);
     this.pBlur = program(gl, BLUR_FRAG);
     this.pNorm2 = program(gl, NORMALIZE2_FRAG);
-    this.pCombine2 = program(gl, COMBINE2_FRAG);
     this.pHole = program(gl, HOLEFILL_FRAG);
     this.pPole = program(gl, POLEFILL_FRAG);
     this.pBlit = program(gl, BLIT_FRAG);
@@ -671,10 +711,20 @@ export class PanoEngine {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     this.avgTex = t8(); this.avgFbo = this._fbo(this.avgTex);
     this.wTex = t8(); this.wFbo = this._fbo(this.wTex);        // warped frame
-    this.wLoTex = t16(); this.wLoFbo = this._fbo(this.wLoTex);  // blurred frame
     this.mTex = t16(); this.mFbo = this._fbo(this.mTex);        // mask / scratch
     this.mHi = t16(); this.mHiFbo = this._fbo(this.mHi);        // mask, narrow blur
     this.pingTex = t16(); this.pingFbo = this._fbo(this.pingTex);
+    this.pyramid = [{ w: cs, h: this.csh, source: this.wTex, sourceFbo: this.wFbo,
+      mask: this.mHi, maskFbo: this.mHiFbo, accum: this.accHi, accumFbo: this.accHiFbo,
+      result: this.accLo, resultFbo: this.accLoFbo }];
+    for (let w = cs / 2, h = this.csh / 2; w >= 64; w /= 2, h /= 2) {
+      const tex = () => this._tex(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR, gl.REPEAT);
+      const source = tex(), mask = tex(), accum = tex(), result = tex();
+      this.pyramid.push({ w, h, source, sourceFbo: this._fbo(source), mask, maskFbo: this._fbo(mask),
+        accum, accumFbo: this._fbo(accum), result, resultFbo: this._fbo(result) });
+    }
+    this.exposureTex = this._tex(256, 128, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST, gl.REPEAT);
+    this.exposureFbo = this._fbo(this.exposureTex);
     this._compReady = true;
   }
 
@@ -687,7 +737,7 @@ export class PanoEngine {
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
   }
 
-  _warpUniforms(prog, uRot, tanX, tanY, gain, vidRot = 0, camera = null, image = null) {
+  _warpUniforms(prog, uRot, tanX, tanY, gain, vidRot = 0, camera = null, image = null, colorGain = [1, 1, 1]) {
     const gl = this.gl;
     const a = (vidRot % 4) * Math.PI / 2;
     const c = Math.cos(a), s = Math.sin(a);
@@ -702,6 +752,7 @@ export class PanoEngine {
     gl.uniform2f(gl.getUniformLocation(prog, 'uTan'), tx, ty);
     gl.uniform1f(gl.getUniformLocation(prog, 'uMaxRadius'), projectionRadiusLimit(tx, ty, center, vidRot, a1, a2, a3));
     gl.uniform1f(gl.getUniformLocation(prog, 'uGain'), gain);
+    gl.uniform3fv(gl.getUniformLocation(prog, 'uColorGain'), colorGain);
     gl.uniform1f(gl.getUniformLocation(prog, 'uK1'), a1);
     gl.uniform1f(gl.getUniformLocation(prog, 'uK2'), a2);
     gl.uniform1f(gl.getUniformLocation(prog, 'uK3'), a3);
@@ -776,11 +827,26 @@ export class PanoEngine {
     // controls seam ownership, rather than deleting entire captured regions.
     const blendFrames = frames;
     const rots = blendFrames.map((f) => matT3col(f.R));
+    // Solve exposure over all geometric overlaps, including textureless
+    // images which have no feature-match edge in the alignment graph.
+    const exposureWarps = blendFrames.map((frame, k) => {
+      this._uploadFrame(frame.img);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.exposureFbo); gl.viewport(0, 0, 256, 128);
+      gl.disable(gl.BLEND); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.useProgram(this.pWarpC);
+      this._warpUniforms(this.pWarpC, rots[k], tanX, tanY, 1, frame.vidRot || 0, frame.camera, frame.img);
+      this._quad();
+      const pixels = new Uint8Array(256 * 128 * 4);
+      gl.readPixels(0, 0, 256, 128, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+      return pixels;
+    });
+    const colorGains = overlapExposure(exposureWarps, 256, 128, blendFrames.map((f) => f.gain || 1));
+    this.exposureGains = colorGains;
     const warpTo = (prog, fbo, k) => {
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
       this._vp();
       const frame = blendFrames[k];
-      this._warpUniforms(prog, rots[k], tanX, tanY, frame.gain || 1, frame.vidRot || 0, frame.camera, frame.img);
+      this._warpUniforms(prog, rots[k], tanX, tanY, 1, frame.vidRot || 0, frame.camera, frame.img, colorGains[k]);
       gl.uniform1f(gl.getUniformLocation(prog, 'uEvidence'), frame.weak ? (frame.connected ? 0.5 : 0.1) : 1);
     };
 
@@ -840,84 +906,73 @@ export class PanoEngine {
       gl.disable(gl.DEPTH_TEST);
     });
 
-    // ---- 3. Burt-Adelson multi-band blend --------------------------------
-    // Each source's detail band is weighted by its mask blurred narrowly (so
-    // detail stays single-source: a cut, never a ghost); each source's base
-    // band by the same mask blurred widely (so exposure/colour ramps across
-    // the seam and the cut stops being visible).
-    const bandSplit = Math.max(8, w / 64);   // detail/base cutoff
-    const maskNarrow = Math.max(0.65, w / 2048);
-    const maskWide = Math.max(24, w / 20);
-
-    [this.accHiFbo, this.accLoFbo].forEach((f) => {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, f);
-      this._vp(); gl.disable(gl.BLEND);
-      gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
-    });
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-    const accBand = (accFbo, maskTex, high) => {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, accFbo);
-      this._vp();
-      gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD); gl.blendFunc(gl.ONE, gl.ONE);
-      gl.useProgram(this.pAcc);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.wTex);
-      gl.uniform1i(gl.getUniformLocation(this.pAcc, 'uW'), 0);
-      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.wLoTex);
-      gl.uniform1i(gl.getUniformLocation(this.pAcc, 'uWLo'), 1);
-      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, maskTex);
-      gl.uniform1i(gl.getUniformLocation(this.pAcc, 'uMask'), 2);
-      gl.uniform1f(gl.getUniformLocation(this.pAcc, 'uHigh'), high);
-      this._quad();
-      gl.disable(gl.BLEND);
+    // ---- 3. Full Gaussian-mask / Laplacian-image pyramid blend ---------
+    const pyramid = this.pyramid;
+    const bind = (unit, tex, prog, name) => {
+      gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.uniform1i(gl.getUniformLocation(prog, name), unit);
     };
-
+    for (const level of pyramid) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, level.accumFbo); gl.viewport(0, 0, level.w, level.h);
+      gl.disable(gl.BLEND); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+    const reduce = (source, target, level, previous) => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, target); gl.viewport(0, 0, level.w, level.h);
+      gl.useProgram(this.pReduce); gl.disable(gl.BLEND);
+      bind(0, source, this.pReduce, 'uSrc');
+      gl.uniform2f(gl.getUniformLocation(this.pReduce, 'uTexel'), 1 / previous.w, 1 / previous.h);
+      this._quad();
+    };
     blendFrames.forEach((fr, k) => {
       this._uploadFrame(fr.img);
-      // warp -> wTex, band split -> wLoTex
-      gl.useProgram(this.pWarpC);
-      warpTo(this.pWarpC, this.wFbo, k);
-      gl.disable(gl.BLEND);
-      gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.useProgram(this.pWarpC); warpTo(this.pWarpC, this.wFbo, k);
+      gl.disable(gl.BLEND); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
       this._quad();
-      this._blur(this.wTex, this.wLoFbo, this.pingTex, this.pingFbo, bandSplit);
-
-      // ownership mask -> mTex, narrow blur -> mHi
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.mFbo);
-      this._vp(); gl.disable(gl.BLEND);
-      gl.useProgram(this.pMask);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.labelTex);
-      gl.uniform1i(gl.getUniformLocation(this.pMask, 'uLabel'), 0);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.mFbo); this._vp(); gl.useProgram(this.pMask);
+      bind(0, this.labelTex, this.pMask, 'uLabel');
       gl.uniform1f(gl.getUniformLocation(this.pMask, 'uWant'), k + 1);
       this._quad();
-      this._blur(this.mTex, this.mHiFbo, this.pingTex, this.pingFbo, maskNarrow);
-      accBand(this.accHiFbo, this.mHi, 1);
-
-      // same mask, wide blur -> base band
-      this._blur(this.mHi, this.mFbo, this.pingTex, this.pingFbo, maskWide);
-      accBand(this.accLoFbo, this.mTex, 0);
+      this._blur(this.mTex, this.mHiFbo, this.pingTex, this.pingFbo, 0.65);
+      for (let i = 1; i < pyramid.length; i++) {
+        const prev = pyramid[i - 1], level = pyramid[i];
+        reduce(prev.source, level.sourceFbo, level, prev);
+        reduce(prev.mask, level.maskFbo, level, prev);
+      }
+      for (let i = pyramid.length - 1; i >= 0; i--) {
+        const level = pyramid[i], coarse = pyramid[i + 1];
+        gl.bindFramebuffer(gl.FRAMEBUFFER, level.resultFbo); gl.viewport(0, 0, level.w, level.h);
+        gl.useProgram(this.pSourceFill);
+        bind(0, level.source, this.pSourceFill, 'uSource');
+        bind(1, coarse?.result || level.source, this.pSourceFill, 'uCoarse');
+        gl.uniform1i(gl.getUniformLocation(this.pSourceFill, 'uBase'), !coarse);
+        this._quad();
+      }
+      for (let i = 0; i < pyramid.length; i++) {
+        const level = pyramid[i], coarse = pyramid[i + 1] || level;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, level.accumFbo); gl.viewport(0, 0, level.w, level.h);
+        gl.useProgram(this.pLaplacian);
+        bind(0, level.result, this.pLaplacian, 'uFine');
+        bind(1, coarse.result, this.pLaplacian, 'uCoarse');
+        bind(2, level.mask, this.pLaplacian, 'uMask');
+        gl.uniform1i(gl.getUniformLocation(this.pLaplacian, 'uBase'), i === pyramid.length - 1);
+        gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD); gl.blendFunc(gl.ONE, gl.ONE);
+        this._quad(); gl.disable(gl.BLEND);
+      }
     });
-
-    // ---- 4. collapse bands -> avgTex ---
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.avgFbo);
-    this._vp(); gl.disable(gl.BLEND);
-    gl.useProgram(this.pCombine2);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.accHi);
-    gl.uniform1i(gl.getUniformLocation(this.pCombine2, 'uHi'), 0);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, this.accLo);
-    gl.uniform1i(gl.getUniformLocation(this.pCombine2, 'uLo'), 1);
-    this._quad();
-
-    // All confidence levels share the same seam/blend chain, so fallback
-    // coverage meets the main mosaic without a hard holes-only paste.
-    const src = this.avgTex;
-
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.panoFbo);
-    gl.viewport(0, 0, this.size, this.h); gl.disable(gl.BLEND);
-    gl.useProgram(this.pBlit);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src);
-    gl.uniform1i(gl.getUniformLocation(this.pBlit, 'uSrc'), 0);
-    gl.uniform1f(gl.getUniformLocation(this.pBlit, 'uFlipY'), 0);
+    // ---- 4. Normalize each band and reconstruct from coarse to fine -----
+    for (let i = pyramid.length - 1; i >= 0; i--) {
+      const level = pyramid[i], coarse = pyramid[i + 1];
+      gl.bindFramebuffer(gl.FRAMEBUFFER, level.resultFbo); gl.viewport(0, 0, level.w, level.h);
+      gl.useProgram(this.pReconstruct);
+      bind(0, level.accum, this.pReconstruct, 'uBand');
+      bind(1, coarse?.result || level.accum, this.pReconstruct, 'uCoarse');
+      gl.uniform1i(gl.getUniformLocation(this.pReconstruct, 'uBase'), !coarse);
+      this._quad();
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.panoFbo); gl.viewport(0, 0, this.size, this.h);
+    gl.useProgram(this.pFinish);
+    bind(0, pyramid[0].result, this.pFinish, 'uResult');
+    bind(1, this.avgTex, this.pFinish, 'uCoverage');
     this._quad();
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
