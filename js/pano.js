@@ -826,7 +826,8 @@ export class PanoEngine {
 
     // ---- 2. graph-cut seam labels -------------------------------------
     const labels = seamLabels(exposureWarps, 512, 256, colorGains,
-      blendFrames.map((fr) => !fr.weak || fr.connected));
+      blendFrames.map((fr) => !fr.weak || fr.connected),
+      { onDiagnostics: (diagnostics) => { this.seamDiagnostics = diagnostics; } });
     const labelPixels = new Uint8Array(w * h * 4);
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
       const p = Math.min(255, Math.floor((y + 0.5) * 256 / h)) * 512 + Math.min(511, Math.floor((x + 0.5) * 512 / w));

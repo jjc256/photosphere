@@ -46,12 +46,15 @@ Alternatives that avoid the cert warning: run any static host
 1. Tap **Start capture** and allow **Motion & Orientation** + **Camera**.
 2. A lattice of **dots** appears around you. Line the centre crosshair up with a
    dot and **hold still** — a ring fills and the frame is grabbed automatically
-   (blurred grabs are rejected). The dot turns green; move to the next one.
+   once the phone is steady. The dot turns green; move to the next one.
+   At the default portrait settings there are **33 dots**: 13 around the middle,
+   9 above, 9 below, and one each at the top and bottom. The guide adapts to
+   your camera field of view. Extra sweep frames fill useful gaps automatically.
 3. Rotate around the camera lens, keeping the lens in one place — don't walk;
    parallax is what breaks hand-held stitching. Keep textured things in frame.
 4. Work outward through the dots (the counter shows how many are done). You
    don't have to get them all — tap **Done** once you've covered what you want.
-5. Tap **Done**. The frames are stitched (a few seconds — "Stitching · …"),
+5. Tap **Done**. The frames are stitched ("Stitching · …"),
    then you land in the review viewer: drag to look around, pinch to zoom,
    toggle the flat equirectangular view.
 6. Tap **Download 360° photo**. The file is saved via the browser's download /
@@ -73,10 +76,12 @@ the rare browser that hands the camera feed sideways.
 | `solver/` + `js/ba.js` | Rust WebAssembly generalized-camera kernel (Gennery projection) plus geometry back-end: direct generalized-camera RANSAC, all-pairs overlap discovery, calibrated shared focal/principal-point/generalized projection (`L`)/three-coefficient PTLens radial model, regularized per-frame focal/principal-point correction, global pose-and-lens bundle adjustment, and gain compensation. `js/solver-worker.js` runs the global solve off the UI thread. |
 | `js/stitch.js` | Runs once on **Done**: OpenCV-WASM features → overlap-graph matching → RANSAC-verify → median focal → **calibrate the lens** (solve k₁ and polish the focal by minimising total pairwise reprojection error) → refine each pair's rotation → rotation-average → component bundle adjustment → gain-compensate. Separate feature groups are rigidly placed using the IMU; sensor-only frames retain coverage at lower seam priority. |
 | `js/pano.js` | WebGL2 engine. `splat()` drives the live capture preview. `compositeStitched()` runs the standard stitcher compositing chain: warp every frame to the sphere → build a consensus mosaic → **graph-cut seam labels** (minimize exposure-corrected disagreement along each joining boundary on a 512×256 sphere, with longitude wrap and equal priority for all feature-verified components) → **Burt–Adelson multi-band blend** (Gaussian ownership masks weight a full Laplacian image pyramid, with coverage-aware border extension) → upscale to `panoTex`. Also the interactive sphere view and equirect read-back for export. |
+| `js/capture-plan.js` | Builds a field-of-view-aware guide with overlap and explicit pole shots. Protects completed-dot photos from eviction in favor of redundant sweep frames. |
+| `js/seams.js` | Seeds graph-cut seams, then revisits images with alpha expansion. Accepts a replacement only when overall energy improves, seam length does not grow, and squared disagreement at overlapping boundaries does not increase. |
 | `js/exposure.js` | Estimates per-channel exposure and white-balance corrections from all geometric overlaps, including plain walls without matched features. Rejects saturation and inconsistent overlap samples, and preserves highlights. |
 | `js/xmp.js` | Builds the GPano XMP packet and splices metadata segments into the JPEG (EXIF then XMP, after `APP0`). |
 | `js/exif.js` | Hand-rolled big-endian **EXIF `APP1`** writer — GPS position, capture time, view direction — the tags Google Maps / Street View needs. |
-| `js/app.js` | Camera + permissions, the auto-capture heuristic (angular step ≈ 0.42 × FOV, only while steady), the coverage grid including explicit zenith/nadir captures, per-frame stash (full-res `ImageData` + a downscaled luma copy for features), the location watch, the review viewer, and export/download. |
+| `js/app.js` | Camera + permissions, the auto-capture heuristic (angular step ≈ 0.4 × the conservative FOV, capped at 20°, only while steady), the adaptive guide including explicit zenith/nadir captures, per-frame stash (full-res `ImageData` + a downscaled luma copy for features), the location watch, the review viewer, and export/download. |
 | `sw.js` + `manifest.webmanifest` | Offline app shell and Home-Screen install. |
 
 Stitching is **feature-based, seeded by the IMU**. SIFT matches (or ORB when
@@ -171,7 +176,8 @@ four frame rotations and four projection models, radial-fold rejection, a
 continuous wide blur, complete 360° coverage, and the browser SIFT backend.
 `FULL_SPHERE=1 node selftest.mjs` checks a complete 24-frame sweep;
 `node selftest-components.mjs` checks component anchoring and radial bounds.
-`node selftest-seams.mjs` checks that seams avoid displaced objects while retaining coverage and verified-source priority.
+`node selftest-seams.mjs` checks that seams avoid displaced objects, shorten existing detours, and retain coverage and verified-source priority.
+`node selftest-capture-plan.mjs` checks reduced guide coverage/overlap across fields of view and protects guide captures from eviction. `CAPTURE_GUIDE=1 node selftest.mjs` exercises the complete 33-dot portrait pattern through the solver (also runnable with the browser SIFT backend).
 `node selftest-exposure.mjs` checks exposure/WB recovery, small match sets, and
 three-image cycle validation. The browser test also renders a full sphere with
 different exposure and white balance in each source and measures seam error.
@@ -189,3 +195,5 @@ correction, so textureless walls no longer receive unrelated brightness gains.
 Low-contrast SIFT detection and a calibrated retry pass recover smaller overlaps;
 low-inlier-ratio matches require corroboration through a three-image cycle. The debug download
 remains available after every stitch, including apparently successful ones.
+
+Debug exports include the solved camera calibration, seam-refinement diagnostics, guide progress, and which photos came from completed dots.

@@ -3,6 +3,7 @@
 // feed the solver NOISY gyro poses + per-frame gain, check it recovers truth.
 
 import { stitch } from './js/stitch.js';
+import { capturePlan } from './js/capture-plan.js';
 import {
   quatFromAxisAngle, multiplyQuat, normalizeQuat, quatAngle,
 } from './js/orientation.js';
@@ -73,13 +74,20 @@ function randSmallQuat(rad) {
 }
 
 // ---- build frames --------------------------------------------------------------
-const W = 480, H = 360, HFOV = 55 * DEG;
+const guided = Boolean(process.env.CAPTURE_GUIDE);
+const W = guided ? 360 : 480, H = guided ? 640 : 360, HFOV = (guided ? 50 : 55) * DEG;
 const F = ((VID_ROT % 2 ? H : W) / 2) / Math.tan(HFOV / 2);
 const yaws = (process.env.FULL_SPHERE ? Array.from({ length: 12 }, (_, i) => i * 30 - 180) : [-75, -45, -15, 15, 45, 75]).map((d) => d * DEG);
 const pitches = [-13 * DEG, 13 * DEG];
 
 const truthQ = [];
-for (const p of pitches) for (const yw of yaws) truthQ.push(normalizeQuat(multiplyQuat(qYawPitch(yw, p), quatFromAxisAngle(0, 0, 1, 7 * DEG))));
+if (guided) {
+  const tanX = Math.tan(HFOV / 2);
+  for (const target of capturePlan(tanX, tanX * H / W).targets) {
+    const d = target.dir;
+    truthQ.push(qYawPitch(target.cap ? 0 : -Math.atan2(d[0], -d[2]), Math.asin(d[1])));
+  }
+} else for (const p of pitches) for (const yw of yaws) truthQ.push(normalizeQuat(multiplyQuat(qYawPitch(yw, p), quatFromAxisAngle(0, 0, 1, 7 * DEG))));
 
 const GYRO_NOISE = 2.5 * DEG;
 const shots = truthQ.map((qt) => {
@@ -87,7 +95,7 @@ const shots = truthQ.map((qt) => {
   const gain = 0.85 + random() * 0.3;
   const g = renderView(qToR(qt), F, W, H);
   for (let i = 0; i < g.length; i++) g[i] = Math.min(255, g[i] * gain);
-  return { gray: g, w: W, h: H, quat: noisy, hfovDeg: 55, vidRot: VID_ROT, _R: qToR(qt), _gain: gain };
+  return { gray: g, w: W, h: H, quat: noisy, hfovDeg: HFOV / DEG, vidRot: VID_ROT, _R: qToR(qt), _gain: gain };
 });
 
 console.log(`${shots.length} frames, gyro noise ${(GYRO_NOISE / DEG).toFixed(1)}deg, true focal ${F.toFixed(1)}px`);

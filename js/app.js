@@ -1,5 +1,6 @@
 import { PanoEngine } from './pano.js';
 import { stitch } from './stitch.js';
+import { capturePlan, redundantShot } from './capture-plan.js';
 import { countCorners } from './orb.js';
 import { buildGPanoXMP, embedMetadata } from './xmp.js';
 import { buildExifSegment } from './exif.js';
@@ -8,7 +9,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.16.5';
+const APP_VERSION = '0.16.6';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -17,7 +18,6 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const MAX_SHOTS = 80;   // favour solver redundancy over minimal capture count
 const CAP_LONG = 960;   // long side kept for compositing
 const GRAY_LONG = 640;  // long side used for feature detection
-const CAP_STEP = 8 * Math.PI / 180; // dense sweep frames keep adjacent overlap high
 const FEAT_MIN = 16;    // capture-time corner floor (countCorners samples a 3px grid)
 
 const state = {
@@ -160,13 +160,16 @@ function fovTangents() {
 // ---- capture reset --------------------------------------------------------
 function resetCoverage() {
   state.shots = [];
+  state._stitchResult = null;
+  state._seamDiagnostics = null;
+  state._stitchLog = [];
   state.lastCapQuat = null;
   state._qHist = [];
   state._steadySince = null;
   state.R0 = null;
   state._r0Deadline = performance.now() + 1600;
   buildTargets();
-  $('coverage').textContent = '0/0';
+  $('coverage').textContent = `0/${state.targets.length} dots`;
 }
 
 // ---- capture --------------------------------------------------------------
@@ -194,7 +197,7 @@ function sharpness(gray, w, h) {
   return n ? sum / n : 0;
 }
 
-function stashShot(manual, cap = null) {
+function stashShot(manual, cap = null, guided = false) {
   const vw = video.videoWidth, vh = video.videoHeight;
   if (!vw) return;
   const sm = grabFrame(GRAY_LONG, vw, vh);
@@ -213,26 +216,12 @@ function stashShot(manual, cap = null) {
   state.shots.push({
     imgData: big.data, w: big.w, h: big.h,
     gray, gw: sm.w, gh: sm.h, sharp, feat,
-    speed: state.speed, t: Math.round(performance.now()), cap,
+    speed: state.speed, t: Math.round(performance.now()), cap, guided,
     quat: state.quat.slice(), hfovDeg: state.hfovDeg, vidRot: state.vidRot,
   });
   if (state.shots.length > MAX_SHOTS) {
-    // over budget: drop one of the closest-together pair (so unique coverage is
-    // never lost), preferring to keep whichever has more matchable detail
-    let bi = 0, bd = Infinity;
-    for (let i = 0; i < state.shots.length; i++) {
-      for (let j = i + 1; j < state.shots.length; j++) {
-        const a = quatAngle(state.shots[i].quat, state.shots[j].quat);
-        if (a < bd) {
-          bd = a;
-          const si = state.shots[i], sj = state.shots[j];
-          // Zenith/nadir captures may have little texture, but are the only
-          // real pixels at the poles. Retain them before regular overlap shots.
-          bi = si.cap && !sj.cap ? j : (!si.cap && sj.cap ? i : (si.feat <= sj.feat ? i : j));
-        }
-      }
-    }
-    state.shots.splice(bi, 1);
+    const drop = redundantShot(state.shots, quatAngle);
+    if (drop >= 0) state.shots.splice(drop, 1);
   }
   return true;
 }
@@ -248,7 +237,7 @@ function doCapture(manual, target = null) {
   // blurrier because the sweep ran on between grabs.
   state.lastCapQuat = state.quat;
   state._lastGrabT = performance.now();
-  const ok = stashShot(manual, target?.cap || null);              // for the real stitch on Done
+  const ok = stashShot(manual, target?.cap || null, Boolean(target));              // for the real stitch on Done
   if (!ok) return false;
   state.engine.splat(video, state.R, tanX, tanY, state.vidRot);   // live guide preview
   const s = $('btn-shutter');
@@ -260,34 +249,13 @@ function doCapture(manual, target = null) {
 }
 
 // ---- guided capture targets (aim → hold → ring fills → snap) --------------
-// A lattice of dots on the sphere, spaced ~60% of the field of view so
-// neighbouring shots overlap enough to stitch. Sized to the current FOV.
+// Portrait video covers much more vertically than horizontally. Use that
+// footprint to choose rings instead of prescribing five for every camera.
 function buildTargets() {
-  // Dense overlap rings plus explicit cap captures. The latter prevent the
-  // equirectangular pole fill from inventing radial streaks at zenith/nadir.
-  // This intentionally oversamples compared with a pleasant manual capture:
-  // Panorama succeeds by having enough pair evidence, so the guide should feed
-  // the same kind of redundant graph instead of trying to be clever and sparse.
-  const rings = [
-    { p: 0, n: 18 },
-    { p: 32, n: 14 },
-    { p: -32, n: 14 },
-    { p: 62, n: 8 },
-    { p: -62, n: 8 },
-  ];
-  const T = [];
-  rings.forEach((r, ri) => {
-    const off = ri % 2 ? 180 / r.n : 0; // stagger alternate rings
-    for (let i = 0; i < r.n; i++) {
-      const y = (i * 360 / r.n + off) * DEG, p = r.p * DEG, cp = Math.cos(p);
-      T.push({ dir: [cp * Math.sin(y), Math.sin(p), -cp * Math.cos(y)], done: false, progress: 0 });
-    }
-  });
-  T.push(
-    { dir: [0, 1, 0], cap: 'zenith', done: false, progress: 0 },
-    { dir: [0, -1, 0], cap: 'nadir', done: false, progress: 0 },
-  );
-  state.targets = T;
+  const { tanX, tanY } = fovTangents();
+  const plan = capturePlan(tanX, tanY);
+  state.targets = plan.targets;
+  state.sweepStep = plan.sweepStep;
   state.activeTarget = -1;
 }
 
@@ -352,14 +320,16 @@ function updateGuidance(now) {
   }
   state.activeTarget = act;
 
-  const CONE = 10 * DEG, FILL = 0.6;
+  const CONE = 6 * DEG, FILL = 0.6;
 
-  // Frames are grabbed as you sweep, every CAP_STEP of pan. Motion blur is the
+  // Frames are grabbed as you sweep, between guide points. Motion blur is the
   // thing that kills feature matching, so rather than grabbing the instant the
   // step is reached, wait for the next slow moment (hands always micro-pause)
   // and only force a grab after a small overshoot. Costs nothing
   // extra and biases every frame toward the sharpest instant available.
   const movedSince = state.lastCapQuat ? quatAngle(state.quat, state.lastCapQuat) : Infinity;
+  const nearestStored = state.shots.reduce((gap, shot) => Math.min(gap, quatAngle(state.quat, shot.quat)), Infinity);
+  const captureStep = state.sweepStep;
   const sweeping = state.speed < 0.28;           // < ~16°/s: blur stays small
   const slowNow = state.speed < 0.12;            // < ~7°/s: a natural pause
   const cooled = now - (state._lastGrabT || 0) > 180;
@@ -375,24 +345,23 @@ function updateGuidance(now) {
     const on = i === act && t._ang < CONE && steady;
     t.progress = clamp(t.progress + (on ? dt / FILL : -dt / 0.3), 0, 1);
     if (t.progress >= 1 && on) {
-      doCapture(true, t);           // deliberate: never rejected
-      t.done = true; t.progress = 1; grabbed = true;
+      if (doCapture(true, t)) {
+        t.done = true; t.progress = 1; grabbed = true;
+      }
     }
   }
 
   // Extra in-between frames while sweeping from dot to dot, purely to keep
   // neighbours overlapping. These are feature-gated and never tick a dot off.
-  if (!grabbed && state.shots.length < MAX_SHOTS && cooled && sweeping &&
-      (movedSince > CAP_STEP * 1.25 || (movedSince > CAP_STEP && slowNow))) {
+  if (!grabbed && state.shots.length < MAX_SHOTS && cooled && sweeping && actAng > CONE && nearestStored > captureStep &&
+      (movedSince > captureStep * 1.25 || (movedSince > captureStep && slowNow))) {
     if (doCapture(false)) grabbed = true;
   }
 
   const done = state.targets.filter((t) => t.done).length;
   const lf = state._lastFeat;
-  $('coverage').textContent =
-    `${state.shots.length}f` + (lf != null ? ` · ${lf < FEAT_MIN * 2 ? '⚠' : ''}${lf}` : '');
-  if (state.shots.length >= MAX_SHOTS) hint.textContent = 'Plenty of frames — tap Done';
-  else if (done === state.targets.length) hint.textContent = 'Dots done — a pass up & down, then Done';
+  $('coverage').textContent = `${done}/${state.targets.length} dots`;
+  if (done === state.targets.length) hint.textContent = 'Dots complete — tap Done';
   else if (state.speed >= 0.28) hint.textContent = 'Slow down — motion blur';
   else if (grabbed && lf != null && lf < 20) hint.textContent = 'Aim at more textured things';
   else hint.textContent = 'Sweep slowly toward the next dot';
@@ -565,6 +534,8 @@ async function toReview() {
     result = { ok: false, log: ['stitch error: ' + (e && e.message || e)] };
   }
   state._stitchLog = result.log || [];
+  state._stitchResult = result;
+  state._seamDiagnostics = null;
   console.log('[stitch]', ...(result.log || []));
   const nConn0 = (result.reliable || result.connected || []).filter(Boolean).length;
   const partial = !result.ok || nConn0 < state.shots.length;
@@ -592,6 +563,7 @@ async function toReview() {
       }));
       const center = result.center || [0.5, 0.5];
       state.engine.compositeStitched(parts, tanX, tanY, result.k1 || 0, result.k2 || 0, result.k3 || 0, result.linearity ?? 1, center);
+      state._seamDiagnostics = state.engine.seamDiagnostics;
       if (nReliable < state.shots.length) toast(`${state.shots.length} frames kept · ${state.shots.length - nReliable} use motion-assisted placement`);
     } else {
       state.engine.bake(); // gyro-only fallback (from the live splat accumulation)
@@ -660,9 +632,12 @@ function saveDebugData() {
     hfovDeg: state.hfovDeg,
     videoWH: [video.videoWidth, video.videoHeight],
     stitchLog: state._stitchLog || [],
+    stitchResult: state._stitchResult || null,
+    seams: state._seamDiagnostics || null,
+    captureGuide: { total: state.targets.length, completed: state.targets.filter((t) => t.done).length },
     shots: state.shots.map((s) => ({
       gw: s.gw, gh: s.gh, w: s.w, h: s.h, quat: s.quat, hfovDeg: s.hfovDeg, vidRot: s.vidRot,
-      sharp: s.sharp, feat: s.feat, speed: s.speed, t: s.t, grayB64: b64(s.gray),
+      guided: Boolean(s.guided), cap: s.cap, sharp: s.sharp, feat: s.feat, speed: s.speed, t: s.t, grayB64: b64(s.gray),
     })),
   };
   const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
@@ -793,7 +768,10 @@ function wire() {
     if (state.targets.length) buildTargets(); // re-space the dot lattice to the new FOV
   });
   $('autocap').addEventListener('change', (e) => (state.autoCap = e.target.checked));
-  $('vidrot').addEventListener('change', (e) => (state.vidRot = +e.target.value));
+  $('vidrot').addEventListener('change', (e) => {
+    state.vidRot = +e.target.value;
+    if (state.targets.length) buildTargets();
+  });
   $('geo').addEventListener('change', (e) => setGeoEnabled(e.target.checked));
 
   // desktop / no-sensor aiming
@@ -858,6 +836,8 @@ function wire() {
 function boot() {
   wire();
   $('app-version').textContent = 'v' + APP_VERSION;
+  $('fov').value = state.hfovDeg;
+  $('fov-val').textContent = state.hfovDeg + '°';
   console.log('PhotoSphere v' + APP_VERSION);
 
   const secure = location.protocol === 'https:' ||

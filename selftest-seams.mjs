@@ -49,3 +49,33 @@ const blank = new Uint8Array(w * h * 4);
 assert.ok(seamLabels([blank], w, h, [[1, 1, 1]], [true]).every((v) => v === -1));
 assert.ok(seamLabels([warps[0]], w, h, [[1, 1, 1]], [true]).every((v, p) => v === (warps[0][p * 4 + 3] ? 0 : -1)));
 console.log(`PASS: ${cuts} seam edges avoid the displaced object; coverage and verified-source priority preserved`);
+
+// Four overlapping views can leave a detour from an earlier insertion even
+// after a better source becomes available. Refinement must actually remove
+// that detour without creating a new cut through the displaced object.
+const rw = 96, rh = 48;
+const sequence = Array.from({ length: 4 }, (_, k) => {
+  const pixels = new Uint8Array(rw * rh * 4);
+  for (let y = 0; y < rh; y++) for (let x = k * 14; x < Math.min(rw, k * 14 + 54); x++) {
+    const object = x > 33 + k * 5 && x < 48 + k * 5 && y > 10 && y < 36;
+    const value = object ? 180 : 80 + Math.floor(y / 6) * 2 + Math.floor(x / 5);
+    pixels.set([value, value, value, 255], (y * rw + x) * 4);
+  }
+  return pixels;
+});
+const sequenceGains = sequence.map(() => [1, 1, 1]), trusted = sequence.map(() => true);
+const firstPass = seamLabels(sequence, rw, rh, sequenceGains, trusted, { refine: false });
+let diagnostics;
+const refined = seamLabels(sequence, rw, rh, sequenceGains, trusted, { onDiagnostics: (d) => { diagnostics = d; } });
+const boundaryLength = (labels) => {
+  let count = 0;
+  for (let p = 0; p < labels.length; p++) for (const q of [Math.floor(p / rw) * rw + (p % rw + 1) % rw, p + rw]) {
+    if (q < labels.length && labels[p] >= 0 && labels[q] >= 0 && labels[p] !== labels[q]) count++;
+  }
+  return count;
+};
+assert.ok(boundaryLength(refined) < boundaryLength(firstPass), 'refinement retained an unnecessary seam detour');
+assert.ok(diagnostics.acceptedMoves > 0);
+assert.equal(diagnostics.after.mismatch, 0, 'refinement introduced a photometric cut');
+for (let p = 0; p < refined.length; p++) assert.ok(refined[p] >= 0 && sequence[refined[p]][p * 4 + 3], 'refinement removed coverage');
+console.log('PASS: refinement shortens an existing seam without increasing source disagreement');

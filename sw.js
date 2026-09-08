@@ -1,11 +1,12 @@
 // App-shell service worker. Network-first for everything (so a redeploy always
 // ships), cache only as an offline fallback.
-const CACHE = 'photosphere-0.16.5';
+const CACHE = 'photosphere-0.16.6';
 const ASSETS = [
   './',
   './index.html',
   './css/style.css',
   './js/app.js',
+  './js/capture-plan.js',
   './js/pano.js',
   './js/exposure.js',
   './js/orientation.js',
