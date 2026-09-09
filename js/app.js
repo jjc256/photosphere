@@ -9,7 +9,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.16.7';
+const APP_VERSION = '0.16.8';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -162,6 +162,7 @@ function resetCoverage() {
   state.shots = [];
   state._stitchResult = null;
   state._seamDiagnostics = null;
+  state._alignmentDiagnostics = null;
   state._stitchLog = [];
   state.lastCapQuat = null;
   state._qHist = [];
@@ -540,6 +541,7 @@ async function toReview() {
   state._stitchLog = result.log || [];
   state._stitchResult = result;
   state._seamDiagnostics = null;
+  state._alignmentDiagnostics = null;
   console.log('[stitch]', ...(result.log || []));
   const nConn0 = (result.reliable || result.connected || []).filter(Boolean).length;
   const partial = !result.ok || nConn0 < state.shots.length;
@@ -568,6 +570,7 @@ async function toReview() {
       const center = result.center || [0.5, 0.5];
       state.engine.compositeStitched(parts, tanX, tanY, result.k1 || 0, result.k2 || 0, result.k3 || 0, result.linearity ?? 1, center);
       state._seamDiagnostics = state.engine.seamDiagnostics;
+      state._alignmentDiagnostics = state.engine.alignmentDiagnostics;
       if (nReliable < state.shots.length) toast(`${state.shots.length} frames kept · ${state.shots.length - nReliable} use motion-assisted placement`);
     } else {
       state.engine.bake(); // gyro-only fallback (from the live splat accumulation)
@@ -638,6 +641,7 @@ function saveDebugData() {
     stitchLog: state._stitchLog || [],
     stitchResult: state._stitchResult || null,
     seams: state._seamDiagnostics || null,
+    localAlignment: state._alignmentDiagnostics || null,
     captureGuide: { total: state.targets.length, completed: state.targets.filter((t) => t.done).length },
     shots: state.shots.map((s) => ({
       gw: s.gw, gh: s.gh, w: s.w, h: s.h, quat: s.quat, hfovDeg: s.hfovDeg, vidRot: s.vidRot,

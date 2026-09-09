@@ -1,3 +1,4 @@
+import { localAlignment } from './local-alignment.js';
 import { seamLabels } from './seams.js';
 import { projectionRadiusLimit } from './camera-geometry.js';
 import { overlapExposure } from './exposure.js';
@@ -114,10 +115,13 @@ uniform float uMaxRadius; // first monotonic radial branch, bounded by source co
 uniform mat2 uVidRot;    // in-plane frame rotation
 uniform vec2 uCenter;    // calibrated principal point in source UVs
 uniform sampler2D uFrame;
+uniform sampler2D uResidual;
+uniform bool uUseResidual;
+uniform bool uCoverageFallback;
 const float PI = 3.14159265359;
-bool warp(out vec3 rgb, out float edge) {
-  float lon = (vUv.x - 0.5) * 2.0 * PI;
-  float lat = (vUv.y - 0.5) * PI;
+bool project(vec2 position, out vec2 uv) {
+  float lon = (position.x - 0.5) * 2.0 * PI;
+  float lat = clamp((position.y - 0.5) * PI, -PI * 0.5, PI * 0.5);
   float cl = cos(lat);
   vec3 world = vec3(cl * sin(lon), sin(lat), -cl * cos(lon));
   vec3 cam = transpose(uRot) * world;
@@ -141,8 +145,17 @@ bool warp(out vec3 rgb, out float edge) {
   float px = distorted.x / uTan.x;
   float py = distorted.y / uTan.y;
   vec2 rp = uVidRot * vec2(px, py);
-  vec2 uv = rp * 0.5 + uCenter;
+  uv = rp * 0.5 + uCenter;
   if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return false;
+  return true;
+}
+bool warp(out vec3 rgb, out float edge) {
+  vec2 uv;
+  float poleFade = smoothstep(0.0, 0.03125, min(vUv.y, 1.0 - vUv.y));
+  vec2 position = vUv + (uUseResidual ? texture(uResidual, vUv).rg * poleFade : vec2(0.0));
+  // Keep unadjusted border pixels only in the coverage mosaic. Let the
+  // aligned sources choose seams, then fill any true holes from that mosaic.
+  if (!project(position, uv) && (!uCoverageFallback || !project(vUv, uv))) return false;
   rgb = clamp(texture(uFrame, uv).rgb * uGain * uColorGain, 0.0, 1.0);
   edge = 2.0 * min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));   // distance to nearest frame edge, 0..1
   return true;
@@ -692,7 +705,7 @@ export class PanoEngine {
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
   }
 
-  _warpUniforms(prog, uRot, tanX, tanY, gain, vidRot = 0, camera = null, image = null, colorGain = [1, 1, 1]) {
+  _warpUniforms(prog, uRot, tanX, tanY, gain, vidRot = 0, camera = null, image = null, colorGain = [1, 1, 1], residual = null) {
     const gl = this.gl;
     const a = (vidRot % 4) * Math.PI / 2;
     const c = Math.cos(a), s = Math.sin(a);
@@ -717,6 +730,11 @@ export class PanoEngine {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.frameTex);
     gl.uniform1i(gl.getUniformLocation(prog, 'uFrame'), 0);
+    gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, residual || this.frameTex);
+    gl.uniform1i(gl.getUniformLocation(prog, 'uResidual'), 7);
+    gl.uniform1i(gl.getUniformLocation(prog, 'uUseResidual'), !!residual);
+    gl.uniform1i(gl.getUniformLocation(prog, 'uCoverageFallback'), prog === this.pFA);
+    gl.activeTexture(gl.TEXTURE0);
   }
 
   // Blur at a reduced resolution with adjacent samples, then interpolate
@@ -784,24 +802,35 @@ export class PanoEngine {
     const rots = blendFrames.map((f) => matT3col(f.R));
     // Solve exposure over all geometric overlaps, including textureless
     // images which have no feature-match edge in the alignment graph.
-    const exposureWarps = blendFrames.map((frame, k) => {
+    const readWarp = (frame, k, residual = null) => {
       this._uploadFrame(frame.img);
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.exposureFbo); gl.viewport(0, 0, 512, 256);
       gl.disable(gl.BLEND); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
       gl.useProgram(this.pWarpC);
-      this._warpUniforms(this.pWarpC, rots[k], tanX, tanY, 1, frame.vidRot || 0, frame.camera, frame.img);
+      this._warpUniforms(this.pWarpC, rots[k], tanX, tanY, 1, frame.vidRot || 0, frame.camera, frame.img, [1, 1, 1], residual);
       this._quad();
       const pixels = new Uint8Array(512 * 256 * 4);
       gl.readPixels(0, 0, 512, 256, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
       return pixels;
+    };
+    let exposureWarps = blendFrames.map((frame, k) => readWarp(frame, k));
+    const alignment = localAlignment(exposureWarps, 512, 256);
+    this.alignmentDiagnostics = alignment.diagnostics;
+    for (const texture of this._residualTextures || []) gl.deleteTexture(texture);
+    this._residualTextures = alignment.fields.map(field => {
+      const tex = this._tex(alignment.width, alignment.height, gl.RG16F, gl.RG, gl.FLOAT, gl.LINEAR, gl.REPEAT);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, alignment.width, alignment.height, gl.RG, gl.FLOAT, field);
+      return tex;
     });
+    exposureWarps = blendFrames.map((frame, k) => readWarp(frame, k, this._residualTextures[k]));
     const colorGains = overlapExposure(exposureWarps, 512, 256, blendFrames.map((f) => f.gain || 1));
     this.exposureGains = colorGains;
     const warpTo = (prog, fbo, k) => {
       gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
       this._vp();
       const frame = blendFrames[k];
-      this._warpUniforms(prog, rots[k], tanX, tanY, 1, frame.vidRot || 0, frame.camera, frame.img, colorGains[k]);
+      this._warpUniforms(prog, rots[k], tanX, tanY, 1, frame.vidRot || 0, frame.camera, frame.img, colorGains[k], this._residualTextures[k]);
       gl.uniform1f(gl.getUniformLocation(prog, 'uEvidence'), frame.weak && !frame.connected ? 0.1 : 1);
     };
 

@@ -69,6 +69,34 @@ try {
   // Full seam/blend chain must preserve a single source right to its border;
   // a zero-priority label used to fail the depth test and leave holes there.
   const identity = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  // Exercise nonzero residual texture sampling, its Y direction, and the
+  // original-coverage fallback through the production shader.
+  engine._k1 = engine._k2 = engine._k3 = 0; engine._linearity = 1;
+  engine._uploadFrame(img);
+  const residual = engine._tex(1, 1, gl.RG16F, gl.RG, gl.FLOAT, gl.LINEAR, gl.REPEAT);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 1, 1, gl.RG, gl.FLOAT, new Float32Array([2/512, -1/256]));
+  const warpPreview = (field) => {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, engine.wFbo); gl.viewport(0, 0, 512, 256);
+    gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); gl.useProgram(engine.pWarpC);
+    engine._warpUniforms(engine.pWarpC, identity, .5, .375, 1, 0, null, img, [1, 1, 1], field);
+    gl.uniform1i(gl.getUniformLocation(engine.pWarpC, 'uCoverageFallback'), true);
+    engine._quad();
+    const p = new Uint8Array(512*256*4); gl.readPixels(0,0,512,256,gl.RGBA,gl.UNSIGNED_BYTE,p);return p;
+  };
+  const original = warpPreview(null), adjusted = warpPreview(residual);
+  let residualChecks = 0;
+  for (let y=20;y<236;y++) for(let x=0;x<512;x++) {
+    const k=(y*512+x)*4, next=((y-1)*512+(x+2)%512)*4;
+    if (original[k+3]) assert(adjusted[k+3]===255, 'residual registration removed captured coverage');
+    if(original[next+3]) {
+      assert(Math.abs(adjusted[k]-original[next])<=1 && Math.abs(adjusted[k+1]-original[next+1])<=1, 'residual warp direction/scale mismatch');
+      residualChecks++;
+    }
+  }
+  assert(residualChecks>1000, 'residual fixture did not exercise the warp');
+  gl.deleteTexture(residual);
+  logs.push('local registration: subframe sampling and border coverage verified');
   // r - r^3 returns to zero at r=1 (45 degrees for a pinhole). That remote
   // circle must not sample the source centre of this narrow-FOV image.
   engine.compositeStitched([{ img, R: identity, gain: 1 }], 0.2, 0.2, 0, -1, 0);

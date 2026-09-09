@@ -79,6 +79,7 @@ the rare browser that hands the camera feed sideways.
 | `solver/` + `js/ba.js` | Rust WebAssembly generalized-camera kernel (Gennery projection) plus geometry back-end: direct generalized-camera RANSAC, all-pairs overlap discovery, calibrated shared focal/principal-point/generalized projection (`L`)/three-coefficient PTLens radial model, regularized per-frame focal/principal-point correction, global pose-and-lens bundle adjustment, and gain compensation. `js/solver-worker.js` runs the global solve off the UI thread. |
 | `js/stitch.js` | Runs once on **Done**: OpenCV-WASM features → overlap-graph matching → RANSAC-verify → median focal → **calibrate the lens** (solve k₁ and polish the focal by minimising total pairwise reprojection error) → refine each pair's rotation → rotation-average → component bundle adjustment → gain-compensate. Separate feature groups are rigidly placed using the IMU; sensor-only frames retain coverage at lower seam priority. |
 | `js/pano.js` | WebGL2 engine. `splat()` drives the live capture preview. `compositeStitched()` runs the standard stitcher compositing chain: warp every frame to the sphere → build a consensus mosaic → **graph-cut seam labels** (minimize exposure-corrected disagreement along each joining boundary on a 512×256 sphere, with longitude wrap and equal priority for all feature-verified components) → **Burt–Adelson multi-band blend** (Gaussian ownership masks weight a full Laplacian image pyramid, with coverage-aware border extension) → upscale to `panoTex`. Also the interactive sphere view and equirect read-back for export. |
+| `js/local-alignment.js` | Registers overlapping image patches and fits a smooth, bounded correction mesh to reduce parallax cuts before seam selection. |
 | `js/capture-plan.js` | Builds a field-of-view-aware guide with overlap and explicit pole shots. Protects completed-dot photos from eviction in favor of redundant sweep frames. |
 | `js/seams.js` | Seeds graph-cut seams, then revisits images with alpha expansion. Accepts a replacement only when overall energy improves, seam length does not grow, and squared disagreement at overlapping boundaries does not increase. |
 | `js/exposure.js` | Estimates per-channel exposure and white-balance corrections from all geometric overlaps, including plain walls without matched features. Rejects saturation and inconsistent overlap samples, and preserves highlights. |
@@ -199,4 +200,11 @@ Low-contrast SIFT detection and a calibrated retry pass recover smaller overlaps
 low-inlier-ratio matches require corroboration through a three-image cycle. The debug download
 remains available after every stitch, including apparently successful ones.
 
-Debug exports include the solved camera calibration, seam-refinement diagnostics, guide progress, and which photos came from completed dots.
+Before seam selection, nearby overlap patches drive a smooth residual alignment mesh.
+Bidirectional checks reject unsupported matches; displacement and slope limits bound
+the correction. The original coverage mosaic fills any holes at shifted borders.
+
+Debug exports include the solved camera calibration, seam-refinement diagnostics,
+local-alignment residuals, guide progress, and which photos came from completed dots.
+
+`node selftest-local-alignment.mjs` checks residual registration with exposure differences, unchanged coherent images, unsupported regions, and bounded deformation. The browser checks exercise the mesh shader and preserve coverage at source borders.
