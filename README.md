@@ -49,7 +49,10 @@ Alternatives that avoid the cert warning: run any static host
    once the phone is steady. The dot turns green; move to the next one.
    At the default portrait settings there are **33 dots**: 13 around the middle,
    9 above, 9 below, and one each at the top and bottom. The guide adapts to
-   your camera field of view. Extra sweep frames fill useful gaps automatically.
+   your camera field of view. Extra sweep frames fill useful gaps automatically,
+   at about 8–10° intervals during a slow move. These add no guide stops.
+   At the 80-photo budget, redundant support photos make room for later views;
+   completed-dot and pole photos are retained.
 3. Rotate around the camera lens, keeping the lens in one place — don't walk;
    parallax is what breaks hand-held stitching. Keep textured things in frame.
 4. Work outward through the dots (the counter shows how many are done). You

@@ -23,7 +23,9 @@ export function capturePlan(tanX, tanY) {
     { dir: [0, 1, 0], cap: 'zenith', done: false, progress: 0 },
     { dir: [0, -1, 0], cap: 'nadir', done: false, progress: 0 },
   );
-  return { targets, sweepStep: Math.max(8, Math.min(20, hfov * 0.4)) * DEG };
+  // Guide dots control deliberate stops; intermediate sweep photos supply
+  // the denser overlap needed by weakly textured real scenes.
+  return { targets, sweepStep: Math.max(5, Math.min(8, hfov * 0.18)) * DEG };
 }
 
 // Sweep frames are expendable; a completed guide dot must keep its photograph.

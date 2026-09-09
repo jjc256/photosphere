@@ -9,7 +9,7 @@ import {
   multiplyQuat, normalizeQuat, quatAngle, forwardDir,
 } from './orientation.js';
 
-const APP_VERSION = '0.16.6';
+const APP_VERSION = '0.16.7';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -330,7 +330,9 @@ function updateGuidance(now) {
   const movedSince = state.lastCapQuat ? quatAngle(state.quat, state.lastCapQuat) : Infinity;
   const nearestStored = state.shots.reduce((gap, shot) => Math.min(gap, quatAngle(state.quat, shot.quat)), Infinity);
   const captureStep = state.sweepStep;
-  const sweeping = state.speed < 0.28;           // < ~16°/s: blur stays small
+  // Permit useful overlap during normal transitions; texture gating still
+  // rejects unusable support photos, and dots retain their steady-hold rule.
+  const sweeping = state.speed < 0.55;           // < ~32°/s
   const slowNow = state.speed < 0.12;            // < ~7°/s: a natural pause
   const cooled = now - (state._lastGrabT || 0) > 180;
   let grabbed = false;
@@ -353,7 +355,9 @@ function updateGuidance(now) {
 
   // Extra in-between frames while sweeping from dot to dot, purely to keep
   // neighbours overlapping. These are feature-gated and never tick a dot off.
-  if (!grabbed && state.shots.length < MAX_SHOTS && cooled && sweeping && actAng > CONE && nearestStored > captureStep &&
+  // stashShot evicts redundant support photos at capacity: keep admitting
+  // new views so later rings receive the same overlap as the first ring.
+  if (!grabbed && cooled && sweeping && actAng > CONE && nearestStored > captureStep &&
       (movedSince > captureStep * 1.25 || (movedSince > captureStep && slowNow))) {
     if (doCapture(false)) grabbed = true;
   }

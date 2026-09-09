@@ -30,7 +30,7 @@ function check(hfov, aspect, lensMargin = 1) {
 const portrait = check(50, 16 / 9, 0.85);
 assert.equal(portrait.targets.length, 33);
 assert.equal(new Set(portrait.targets.filter((t) => !t.cap).map((t) => t.dir[1])).size, 3);
-assert.ok(portrait.sweepStep > 17 * DEG && portrait.sweepStep < 20 * DEG);
+assert.ok(portrait.sweepStep >= 5 * DEG && portrait.sweepStep <= 8 * DEG);
 for (const fov of [35, 65, 90, 110]) for (const aspect of [16 / 9, 9 / 16, 1]) check(fov, aspect, 0.9);
 console.log('PASS: adaptive rings cover the sphere with overlap and reduce default portrait dots from 64 to 33');
 
