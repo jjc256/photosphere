@@ -79,6 +79,19 @@ export function forwardDir(R) {
   return [-R[6], -R[7], -R[8]];
 }
 
+// Convert the compass bearing of the current camera view into the bearing of
+// the equirectangular panorama's centre column (world -Z / longitude 0).
+// GPano PoseHeadingDegrees describes that fixed column, not the direction the
+// phone happened to face when the compass sample was taken.
+export function panoHeadingFromCompass(compassHeading, R) {
+  if (!Number.isFinite(compassHeading) || !R) return null;
+  const forward = forwardDir(R);
+  const horizontal = Math.hypot(forward[0], forward[2]);
+  if (horizontal < 1e-3) return null; // heading is undefined at a pole
+  const renderedYaw = Math.atan2(forward[0], -forward[2]) / DEG;
+  return ((compassHeading - renderedYaw) % 360 + 360) % 360;
+}
+
 // Is a world-space unit vector inside the camera frustum? (mirrors the splat shader)
 export function inFrustum(R, wx, wy, wz, tanX, tanY) {
   const cx = R[0] * wx + R[1] * wy + R[2] * wz;
