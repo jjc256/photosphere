@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import { anchorComponents, expSO3, matMul3, matT3 } from './js/ba.js';
 import { projectionRadiusLimit } from './js/camera-geometry.js';
+import { panoHeadingFromCompass, yawPitchToMat3 } from './js/orientation.js';
 
 const groups = [0, 0, 0, 0, 4, 4, 4, 7];
 const truth = groups.map((_, i) => expSO3([0.15 * i, 0.6 * i, -0.1 * i]));
@@ -29,5 +30,12 @@ const quarticLimit = projectionRadiusLimit(0.2, 0.2, [0.5, 0.5], 0, -3, 0, 1);
 assert.ok(quarticLimit < 0.2 && Math.abs(1 - 6 * quarticLimit + 4 * quarticLimit ** 3) < 1e-10);
 const normalLimit = projectionRadiusLimit(0.2, 0.2, [0.5, 0.5], 0, 0, -1, 0);
 assert.ok(normalLimit < 1 / Math.sqrt(3) && Math.abs(normalLimit - normalLimit ** 3 - Math.hypot(0.2, 0.2)) < 1e-10);
+// GPano heading is the bearing of longitude zero, not the live camera bearing.
+// A camera facing south in a north-aligned renderer must still export north at
+// the panorama centre; this is the exact case that used to upload 180° off.
+assert.ok(Math.abs(panoHeadingFromCompass(180, yawPitchToMat3(Math.PI, 0))) < 1e-10);
+assert.ok(Math.abs(panoHeadingFromCompass(10, yawPitchToMat3(20 * Math.PI / 180, 0)) - 30) < 1e-5);
+assert.equal(panoHeadingFromCompass(NaN, yawPitchToMat3(0, 0)), null);
 console.log('PASS: secondary groups and isolated frames retain coverage in the main sensor reference');
 console.log('PASS: lens coverage stops before radial distortion folds');
+console.log('PASS: GPano centre heading is compass-aligned and wraps correctly');

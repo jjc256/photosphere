@@ -6,10 +6,10 @@ import { buildGPanoXMP, embedMetadata } from './xmp.js';
 import { buildExifSegment } from './exif.js';
 import {
   DEG, deviceQuat, quatToMat3, yawPitchToMat3, quatFromAxisAngle,
-  multiplyQuat, normalizeQuat, quatAngle, forwardDir,
+  multiplyQuat, normalizeQuat, quatAngle, forwardDir, panoHeadingFromCompass,
 } from './orientation.js';
 
-const APP_VERSION = '0.16.8';
+const APP_VERSION = '0.16.9';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -28,7 +28,8 @@ const state = {
   quat: [0, 0, 0, 1],
   R: yawPitchToMat3(0, 0),
   lastCapQuat: null,
-  headingDeg: null,
+  headingDeg: null,       // frozen bearing of the panorama centre column
+  liveHeadingDeg: null,   // latest compass-to-renderer frame alignment
   geo: null,          // { lat, lon, alt, acc } — embedded only in the downloaded file
   geoWatch: null,
   hfovDeg: 50,
@@ -81,9 +82,10 @@ function onOrient(e) {
     ((screen.orientation && screen.orientation.angle) || window.orientation || 0) * DEG;
   state.lastOrientQuat = deviceQuat(
     (e.alpha || 0) * DEG, (e.beta || 0) * DEG, (e.gamma || 0) * DEG, screenAngle);
-  if (typeof e.webkitCompassHeading === 'number' && !Number.isNaN(e.webkitCompassHeading) &&
-      state.headingDeg === null) {
-    state.headingDeg = e.webkitCompassHeading;
+  if (typeof e.webkitCompassHeading === 'number' && Number.isFinite(e.webkitCompassHeading)) {
+    const R = quatToMat3(state.lastOrientQuat);
+    const heading = panoHeadingFromCompass(e.webkitCompassHeading, R);
+    if (heading !== null) state.liveHeadingDeg = heading;
   }
 }
 
@@ -168,6 +170,7 @@ function resetCoverage() {
   state._qHist = [];
   state._steadySince = null;
   state.R0 = null;
+  state.headingDeg = null;
   state._r0Deadline = performance.now() + 1600;
   buildTargets();
   $('coverage').textContent = `0/${state.targets.length} dots`;
@@ -214,6 +217,9 @@ function stashShot(manual, cap = null, guided = false) {
 
   const sharp = sharpness(gray, sm.w, sm.h); // for near-duplicate eviction
   const big = grabFrame(CAP_LONG, vw, vh);
+  // Freeze the current compass-to-renderer alignment with the first accepted
+  // frame. Later compass noise must not rotate an already-built panorama.
+  if (!state.shots.length) state.headingDeg = state.liveHeadingDeg;
   state.shots.push({
     imgData: big.data, w: big.w, h: big.h,
     gray, gw: sm.w, gh: sm.h, sharp, feat,
